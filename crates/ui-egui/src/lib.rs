@@ -913,10 +913,17 @@ impl SolveApp {
             linked_source::start_selected(self);
             return;
         }
-        if matches!(id, "file.insert_step" | "file.insert_mesh") {
-            self.pick_open(|app, path| {
+        if matches!(id, "file.insert_step" | "file.insert_mesh" | "file.insert_mesh_solid") {
+            let as_solid = id == "file.insert_mesh_solid";
+            self.pick_open(move |app, path| {
                 if let Some(path) = path {
-                    app.insert_path_async(&path);
+                    if as_solid && solidcraft_engine::io::is_mesh_path(&path) {
+                        file_load::begin_mesh_solid(app, &path);
+                    } else if as_solid && !solidcraft_engine::io::is_mesh_path(&path) {
+                        app.set_status("Insert Mesh as Solid needs a 3MF, STL, OBJ or glTF file", true);
+                    } else {
+                        app.insert_path_async(&path);
+                    }
                 }
             });
             return;
@@ -1167,9 +1174,23 @@ impl SolveApp {
     /// Insert a STEP file's bodies (an Import base feature) or a mesh file's meshes into the
     /// current design.
     pub fn insert_path(&mut self, path: &str) {
-        let cmd = if solidcraft_engine::io::is_mesh_path(path) { "file.insert_mesh" } else { "file.insert_step" };
+        self.insert_path_with(path, json!({}));
+    }
+
+    /// [`Self::insert_path`] with extra command parameters (for example `convert: true`).
+    pub fn insert_path_with(&mut self, path: &str, extra: Value) {
+        let cmd = if solidcraft_engine::io::is_mesh_path(path) {
+            if extra.get("convert").and_then(Value::as_bool) == Some(true) { "file.insert_mesh_solid" } else { "file.insert_mesh" }
+        } else {
+            "file.insert_step"
+        };
+        let mut params = match extra {
+            Value::Object(map) => map,
+            _ => serde_json::Map::new(),
+        };
+        params.insert("path".into(), json!(path));
         let before: Vec<String> = self.session.world_state().bodies.iter().map(|b| b.name.clone()).collect();
-        if let Ok(r) = self.run(cmd, json!({ "path": path })) {
+        if let Ok(r) = self.run(cmd, Value::Object(params)) {
             self.fit_view();
             stand_up::offer(self, path, &before, Some(&r));
             if let Some(w) = r["warnings"].as_array().filter(|w| !w.is_empty()) {

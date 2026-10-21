@@ -526,6 +526,7 @@
   "cmd.face_delete": "Slet flade",
   "cmd.file_export": "Eksportér",
   "cmd.file_insert_mesh": "Indsæt mesh",
+  "cmd.file_insert_mesh_solid": "Indsæt mesh som solid",
   "cmd.file_insert_step": "Indsæt STEP",
   "cmd.file_save_mesh": "Gem som mesh",
   "cmd.file_slicers": "Installerede slicere",

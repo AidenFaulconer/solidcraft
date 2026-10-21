@@ -526,6 +526,7 @@
   "cmd.face_delete": "Padam Muka",
   "cmd.file_export": "Eksport",
   "cmd.file_insert_mesh": "Sisip Mesh",
+  "cmd.file_insert_mesh_solid": "Sisip mesh sebagai pepejal",
   "cmd.file_insert_step": "Sisip STEP",
   "cmd.file_save_mesh": "Simpan sebagai Mesh",
   "cmd.file_slicers": "Penghiris Terpasang",

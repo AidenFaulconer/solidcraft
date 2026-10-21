@@ -63,7 +63,11 @@ impl Request {
     fn command(&self) -> (&'static str, Value) {
         match &self.kind {
             Kind::Open => ("doc.open", self.params()),
-            Kind::Insert if solidcraft_engine::io::is_mesh_path(&self.path) => ("file.insert_mesh", json!({"path": self.path})),
+            Kind::Insert if solidcraft_engine::io::is_mesh_path(&self.path) => {
+                let cmd =
+                    if self.options.get("convert").and_then(Value::as_bool) == Some(true) { "file.insert_mesh_solid" } else { "file.insert_mesh" };
+                (cmd, self.params())
+            }
             Kind::Insert => ("file.insert_step", self.params()),
             Kind::Recover { id, dir } => ("doc.recover", json!({"id": id, "dir": dir})),
             Kind::ExportDxf => ("file.export_view_dxf", Value::Object(self.options.clone())),
@@ -198,6 +202,13 @@ pub fn begin(app: &mut SolveApp, path: &str, insert: bool) {
     let _ = begin_request(app, Request::new(path, if insert { Kind::Insert } else { Kind::Open }));
 }
 
+/// Insert a mesh file and reconstruct supported bodies as solids (`file.insert_mesh_solid`).
+pub fn begin_mesh_solid(app: &mut SolveApp, path: &str) {
+    let mut request = Request::new(path, Kind::Insert);
+    request.options.insert("convert".into(), json!(true));
+    let _ = begin_request(app, request);
+}
+
 /// Queue a file operation; on the web (no threads) it runs now.
 pub fn begin_request(app: &mut SolveApp, request: Request) -> Result<(), String> {
     #[cfg(target_arch = "wasm32")]
@@ -209,7 +220,7 @@ pub fn begin_request(app: &mut SolveApp, request: Request) -> Result<(), String>
         }
         let r = match &request.kind {
             Kind::Insert => {
-                app.insert_path(&request.path);
+                app.insert_path_with(&request.path, Value::Object(request.options.clone()));
                 Ok(Value::Null)
             }
             Kind::Open => {
@@ -259,7 +270,7 @@ pub fn control(app: &mut SolveApp, req: crate::control::ControlRequest) -> Optio
     let command = req.params.get("command").or(req.params.get("id")).and_then(Value::as_str);
     let kind = match command {
         Some("doc.open") => Kind::Open,
-        Some("file.insert_step" | "file.insert_mesh") => Kind::Insert,
+        Some("file.insert_step" | "file.insert_mesh" | "file.insert_mesh_solid") => Kind::Insert,
         Some("file.export_view_dxf") => Kind::ExportDxf,
         _ => return Some(req),
     };

@@ -526,6 +526,7 @@
   "cmd.face_delete": "면 삭제",
   "cmd.file_export": "내보내기",
   "cmd.file_insert_mesh": "메쉬 삽입",
+  "cmd.file_insert_mesh_solid": "메쉬를 솔리드로 삽입",
   "cmd.file_insert_step": "STEP 삽입",
   "cmd.file_save_mesh": "메쉬로 저장",
   "cmd.file_slicers": "설치된 슬라이서",

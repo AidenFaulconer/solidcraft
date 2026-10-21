@@ -526,6 +526,7 @@
   "cmd.face_delete": "面を削除",
   "cmd.file_export": "エクスポート",
   "cmd.file_insert_mesh": "メッシュを挿入",
+  "cmd.file_insert_mesh_solid": "メッシュをソリッドとして挿入",
   "cmd.file_insert_step": "STEP を挿入",
   "cmd.file_save_mesh": "メッシュとして保存",
   "cmd.file_slicers": "インストール済みのスライサー",

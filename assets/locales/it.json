@@ -526,6 +526,7 @@
   "cmd.face_delete": "Elimina faccia",
   "cmd.file_export": "Esporta",
   "cmd.file_insert_mesh": "Inserisci mesh",
+  "cmd.file_insert_mesh_solid": "Inserisci mesh come solido",
   "cmd.file_insert_step": "Inserisci STEP",
   "cmd.file_save_mesh": "Salva come mesh",
   "cmd.file_slicers": "Slicer installati",

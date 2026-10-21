@@ -91,6 +91,7 @@ mod loopblend;
 mod matchsurf;
 mod measure;
 mod mesh_convert;
+mod mesh_recognize;
 mod meshbody;
 #[cfg(test)]
 mod modify_history_tests;
@@ -188,7 +189,7 @@ pub use lip::{raise_band, rim_band};
 pub use loft_blend::loft_blend;
 pub use matchsurf::{match_surface, seam_continuity};
 pub use measure::{BodyMeasure, MassMeasure, measure, measure_mass};
-pub use mesh_convert::convert_prismatic_mesh;
+pub use mesh_convert::{convert_mesh, convert_prismatic_mesh};
 pub use meshbody::{MAX_TRIANGLES, mesh_body};
 pub use native::{decode_native_body, encode_native_body, native_preview_mesh};
 pub use offset::with_same_surface;

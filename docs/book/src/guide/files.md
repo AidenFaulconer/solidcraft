@@ -46,7 +46,9 @@ list shows the slicers found on the computer with their icons; **Custom…** add
 to the top of the list (kept between runs; hover an entry you added and press Delete to remove it).
 
 Closed mechanical meshes with a constant cross-section can be rebuilt as solids with the
-`mesh.convert` command (command palette, scripts and the control channel).
+`mesh.convert` command (command palette, scripts and the control channel), or imported already
+converted with **File → Insert Mesh as Solid…** (`file.insert_mesh_solid`, also
+`file.insert_mesh` with `convert: true`).
 
 **File → Export 3MF…** with the format changed to **3MF with face tags** (`file.export` or `file.save_mesh` with `format: "3mf-tagged"`) writes an
 ordinary 3MF in which every triangle also names the B-rep face it lies on and every coordinate

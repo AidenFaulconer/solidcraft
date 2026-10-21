@@ -526,6 +526,7 @@
   "cmd.face_delete": "Excluir face",
   "cmd.file_export": "Exportar",
   "cmd.file_insert_mesh": "Inserir malha",
+  "cmd.file_insert_mesh_solid": "Inserir malha como sólido",
   "cmd.file_insert_step": "Inserir STEP",
   "cmd.file_save_mesh": "Salvar como malha",
   "cmd.file_slicers": "Fatiadores instalados",

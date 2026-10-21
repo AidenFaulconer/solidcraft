@@ -526,6 +526,7 @@
   "cmd.face_delete": "刪除面",
   "cmd.file_export": "匯出",
   "cmd.file_insert_mesh": "插入網格",
+  "cmd.file_insert_mesh_solid": "將網格作為實體插入",
   "cmd.file_insert_step": "插入 STEP",
   "cmd.file_save_mesh": "另存為網格",
   "cmd.file_slicers": "已安裝的切片軟體",

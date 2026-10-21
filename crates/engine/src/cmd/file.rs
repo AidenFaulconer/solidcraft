@@ -28,7 +28,11 @@ pub static COMMANDS: &[CommandSpec] = &[
     CommandSpec::new("file.insert_mesh", "Insert Mesh", insert_mesh)
         .at("SOLID", "INSERT")
         .icon("import")
-        .params("path: .3mf, .stl, .obj, .glb or .gltf file (its meshes join the design as mesh bodies in a new component named after the file → component, component_name, occurrence; a glTF file's node tree becomes nested components held as one rigid group until component.unlock, a mesh placed again another occurrence, its materials the bodies' appearances, and its metres millimetres); name?; up?: z|y for a glTF file (default y: glTF has Y up, so the import's component is turned a quarter turn about X, Y becoming Z → stand_up: its occurrence; z: the file's axes are kept)"),
+        .params("path: .3mf, .stl, .obj, .glb or .gltf file (its meshes join the design as mesh bodies in a new component named after the file → component, component_name, occurrence; a glTF file's node tree becomes nested components held as one rigid group until component.unlock, a mesh placed again another occurrence, its materials the bodies' appearances, and its metres millimetres); name?; up?: z|y for a glTF file (default y: glTF has Y up, so the import's component is turned a quarter turn about X, Y becoming Z → stand_up: its occurrence; z: the file's axes are kept); convert?: bool (default false: keep meshes; true: reconstruct each closed constant-section mesh as an editable solid with mesh.convert, same as file.insert_mesh_solid); tolerance?: length expression when convert is true (default 0.05 mm)"),
+    CommandSpec::new("file.insert_mesh_solid", "Insert Mesh as Solid", insert_mesh_solid)
+        .at("SOLID", "INSERT")
+        .icon("import")
+        .params("path: .3mf, .stl, .obj, .glb or .gltf file (insert as file.insert_mesh, then reconstruct each closed constant-section mesh as editable planar and cylindrical faces so the bodies can be filleted, joined and used in assemblies; unsupported freeform meshes are refused and the design is left unchanged); name?; up?: z|y for a glTF file (see file.insert_mesh); tolerance?: length expression (default 0.05 mm)"),
     CommandSpec::new("file.save", "Save", save)
         .icon("save")
         .key("Ctrl+S")
@@ -203,13 +207,34 @@ fn mesh_up(p: &Value, path: &str, cmd: &str) -> Result<Option<bool>> {
 }
 
 fn insert_mesh(s: &mut Session, p: &Value) -> Result<Value> {
-    let cmd = "file.insert_mesh";
+    insert_mesh_with(s, p, "file.insert_mesh", bool_(p, "convert").unwrap_or(false))
+}
+
+fn insert_mesh_solid(s: &mut Session, p: &Value) -> Result<Value> {
+    insert_mesh_with(s, p, "file.insert_mesh_solid", true)
+}
+
+/// Insert a mesh file; when `convert` is true, reconstruct every imported mesh body as a solid.
+fn insert_mesh_with(s: &mut Session, p: &Value, cmd: &str, convert: bool) -> Result<Value> {
     let path = path_arg(p, cmd)?;
     if !solidcraft_io::is_mesh_path(path) {
         return Err(bad(cmd, "only 3MF, STL, OBJ and glTF files (.3mf, .stl, .obj, .glb, .gltf) can be inserted as meshes"));
     }
     let up = mesh_up(p, path, cmd)?;
-    add_mesh(s, path, str_(p, "name"), up)
+    let mut out = add_mesh(s, path, str_(p, "name"), up)?;
+    if !convert {
+        return Ok(out);
+    }
+    let bodies: Vec<String> =
+        out.get("bodies").and_then(Value::as_array).map(|a| a.iter().filter_map(Value::as_str).map(str::to_owned).collect()).unwrap_or_default();
+    if bodies.is_empty() {
+        return Err(bad(cmd, "the file has no mesh bodies to convert"));
+    }
+    let tolerance = crate::params::expr(p, "tolerance").unwrap_or_else(|| "0.05 mm".into());
+    let converted = super::mesh::convert_bodies(s, cmd, &bodies, tolerance.as_str())?;
+    out["converted"] = json!(converted);
+    out["solid"] = json!(true);
+    Ok(out)
 }
 
 fn insert_step(s: &mut Session, p: &Value) -> Result<Value> {

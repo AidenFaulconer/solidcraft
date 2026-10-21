@@ -526,6 +526,7 @@
   "cmd.face_delete": "Удалить грань",
   "cmd.file_export": "Экспорт",
   "cmd.file_insert_mesh": "Вставить меш",
+  "cmd.file_insert_mesh_solid": "Вставить меш как твёрдое тело",
   "cmd.file_insert_step": "Вставить STEP",
   "cmd.file_save_mesh": "Сохранить как меш",
   "cmd.file_slicers": "Установленные слайсеры",

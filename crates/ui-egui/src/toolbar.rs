@@ -527,6 +527,10 @@ fn file_menu(app: &mut SolveApp, ctx: &egui::Context) {
                     app.start("file.insert_mesh");
                     close = true;
                 }
+                if item_if(ui, "Insert Mesh as Solid…", "", "import", shown) {
+                    app.start("file.insert_mesh_solid");
+                    close = true;
+                }
                 if item_if(ui, &format!("{}…", app.tr_label("Insert Design")), "", "component", shown) {
                     app.start("component.insert_design");
                     close = true;
@@ -2353,8 +2357,18 @@ mod home_tests {
             let name = if cmd { format!("Ctrl+{key}") } else { key.to_string() };
             actions.push((name, Box::new(move |h| drop(h.call("ui.key", json!({"key": key, "cmd": cmd}))))));
         }
-        for item in ["Insert STEP…", "Insert Mesh…", "Save", "Save As…", "Export STL…", "Export STEP…", "Export 3MF…", "Export OBJ…", "Export URDF…"]
-        {
+        for item in [
+            "Insert STEP…",
+            "Insert Mesh…",
+            "Insert Mesh as Solid…",
+            "Save",
+            "Save As…",
+            "Export STL…",
+            "Export STEP…",
+            "Export 3MF…",
+            "Export OBJ…",
+            "Export URDF…",
+        ] {
             actions.push((
                 format!("File › {item}"),
                 Box::new(move |h| {

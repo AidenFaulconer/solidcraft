@@ -526,6 +526,7 @@
   "cmd.face_delete": "Eliminar cara",
   "cmd.file_export": "Exportar",
   "cmd.file_insert_mesh": "Insertar malla",
+  "cmd.file_insert_mesh_solid": "Insertar malla como sólido",
   "cmd.file_insert_step": "Insertar STEP",
   "cmd.file_save_mesh": "Guardar como malla",
   "cmd.file_slicers": "Laminadores instalados",

@@ -526,6 +526,7 @@
   "cmd.face_delete": "Yüzü sil",
   "cmd.file_export": "Dışa aktar",
   "cmd.file_insert_mesh": "Ağ ekle",
+  "cmd.file_insert_mesh_solid": "Ağı katı olarak ekle",
   "cmd.file_insert_step": "STEP ekle",
   "cmd.file_save_mesh": "Ağ olarak kaydet",
   "cmd.file_slicers": "Yüklü dilimleyiciler",

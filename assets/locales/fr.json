@@ -526,6 +526,7 @@
   "cmd.face_delete": "Supprimer la face",
   "cmd.file_export": "Exporter",
   "cmd.file_insert_mesh": "Insérer un maillage",
+  "cmd.file_insert_mesh_solid": "Insérer un maillage en solide",
   "cmd.file_insert_step": "Insérer un STEP",
   "cmd.file_save_mesh": "Enregistrer comme maillage",
   "cmd.file_slicers": "Slicers installés",

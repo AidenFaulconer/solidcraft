@@ -526,6 +526,7 @@
   "cmd.face_delete": "Vlak verwijderen",
   "cmd.file_export": "Exporteren",
   "cmd.file_insert_mesh": "Mesh invoegen",
+  "cmd.file_insert_mesh_solid": "Mesh als solid invoegen",
   "cmd.file_insert_step": "STEP invoegen",
   "cmd.file_save_mesh": "Opslaan als mesh",
   "cmd.file_slicers": "Geïnstalleerde slicers",

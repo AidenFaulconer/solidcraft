@@ -526,6 +526,7 @@
   "cmd.face_delete": "Видалити грань",
   "cmd.file_export": "Експорт",
   "cmd.file_insert_mesh": "Вставити сітку",
+  "cmd.file_insert_mesh_solid": "Вставити сітку як тверде тіло",
   "cmd.file_insert_step": "Вставити STEP",
   "cmd.file_save_mesh": "Зберегти як сітку",
   "cmd.file_slicers": "Встановлені слайсери",

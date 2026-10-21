@@ -526,6 +526,7 @@
   "cmd.face_delete": "Xóa Bề mặt",
   "cmd.file_export": "Xuất tệp",
   "cmd.file_insert_mesh": "Chèn lưới đa giác (Mesh)",
+  "cmd.file_insert_mesh_solid": "Chèn mesh thành khối đặc",
   "cmd.file_insert_step": "Chèn tệp STEP",
   "cmd.file_save_mesh": "Lưu dưới dạng lưới đa giác",
   "cmd.file_slicers": "Phần mềm cắt lớp đã cài đặt",

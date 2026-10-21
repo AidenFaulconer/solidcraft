@@ -23,6 +23,79 @@ fn imported_box() -> Session {
 }
 
 #[test]
+fn insert_mesh_as_solid_reconstructs_stl_and_exports_step() {
+    let mut s = Session::default();
+    run(&mut s, "solid.box", json!({"length": 10, "width": 20, "height": 30, "operation": "new", "body_name": "Stock"}));
+    let path = std::env::temp_dir().join(format!("solidcraft-insert-mesh-solid-{}.stl", std::process::id()));
+    run(&mut s, "file.save_mesh", json!({"path": &path, "bodies": ["Stock"]}));
+    run(&mut s, "file.new", json!({"name": "Assembly"}));
+    let r = run(&mut s, "file.insert_mesh_solid", json!({"path": path.to_string_lossy(), "tolerance": "0.05 mm"}));
+    assert_eq!(r["solid"], json!(true));
+    assert_eq!(r["converted"].as_array().map(|a| a.len()), Some(1));
+    let name = r["bodies"][0].as_str().unwrap().to_owned();
+    let state = s.model.state();
+    let body = &state.body(&name).unwrap().body;
+    assert!(!body.is_mesh());
+    assert_eq!(body.faces(0.01).unwrap().len(), 6);
+    let step = std::env::temp_dir().join(format!("solidcraft-insert-mesh-solid-{}.step", std::process::id()));
+    run(&mut s, "file.export", json!({"path": &step, "bodies": [name]}));
+    let text = std::fs::read_to_string(&step).unwrap();
+    assert!(text.contains("ISO-10303-21"), "{text}");
+    assert!(text.contains("MANIFOLD_SOLID_BREP") || text.contains("ADVANCED_BREP_SHAPE_REPRESENTATION"), "{text}");
+    run(&mut s, "solid.fillet", json!({"body": name, "edges": [[0, 10, 30]], "radius": 1}));
+    assert!(s.model.results.iter().all(|r| r.error.is_none()), "{:?}", s.model.results);
+    let _ = std::fs::remove_file(path);
+    let _ = std::fs::remove_file(step);
+}
+
+#[test]
+fn insert_mesh_convert_flag_matches_insert_mesh_solid() {
+    let mut s = Session::default();
+    run(&mut s, "solid.box", json!({"length": 8, "width": 8, "height": 8, "operation": "new", "body_name": "Cube"}));
+    let path = std::env::temp_dir().join(format!("solidcraft-insert-mesh-convert-{}.stl", std::process::id()));
+    run(&mut s, "file.save_mesh", json!({"path": &path, "bodies": ["Cube"]}));
+    run(&mut s, "file.new", json!({"name": "Via flag"}));
+    let r = run(&mut s, "file.insert_mesh", json!({"path": path.to_string_lossy(), "convert": true, "tolerance": "0.05 mm"}));
+    assert_eq!(r["solid"], json!(true));
+    let name = r["bodies"][0].as_str().unwrap();
+    assert!(!s.model.state().body(name).unwrap().body.is_mesh());
+    let _ = std::fs::remove_file(path);
+}
+
+#[test]
+fn insert_mesh_as_solid_refuses_unsupported_mesh_without_changing_the_design() {
+    let mut s = Session::default();
+    // A tetrahedron is closed but not a constant-section prism.
+    let mesh = MeshData {
+        name: "Tet".into(),
+        positions: vec![0., 0., 0., 10., 0., 0., 5., 8., 0., 5., 3., 7.],
+        triangles: vec![0, 1, 2, 0, 1, 3, 1, 2, 3, 0, 2, 3],
+        color: None,
+    };
+    let bytes = {
+        // Write a tiny ASCII STL of the tetrahedron.
+        let mut out = String::from("solid tet\n");
+        let p = |i: usize| [mesh.positions[i * 3], mesh.positions[i * 3 + 1], mesh.positions[i * 3 + 2]];
+        for tri in mesh.triangles.chunks(3) {
+            let (a, b, c) = (p(tri[0] as usize), p(tri[1] as usize), p(tri[2] as usize));
+            out.push_str("facet normal 0 0 0\nouter loop\n");
+            for v in [a, b, c] {
+                out.push_str(&format!("vertex {} {} {}\n", v[0], v[1], v[2]));
+            }
+            out.push_str("endloop\nendfacet\n");
+        }
+        out.push_str("endsolid tet\n");
+        out.into_bytes()
+    };
+    let path = std::env::temp_dir().join(format!("solidcraft-insert-mesh-solid-tet-{}.stl", std::process::id()));
+    std::fs::write(&path, bytes).unwrap();
+    let before = s.doc.to_json();
+    assert!(s.execute("file.insert_mesh_solid", &json!({"path": path.to_string_lossy()})).is_err());
+    assert_eq!(s.doc.to_json(), before);
+    let _ = std::fs::remove_file(path);
+}
+
+#[test]
 fn mesh_conversion_is_parametric_undoable_and_editable_after_cold_reopen() {
     let mut s = imported_box();
     run(&mut s, "parameters.add", json!({"name":"size","expression":"1","unit":""}));

@@ -526,6 +526,7 @@
   "cmd.face_delete": "Smazat plochu",
   "cmd.file_export": "Exportovat",
   "cmd.file_insert_mesh": "Vložit síť",
+  "cmd.file_insert_mesh_solid": "Vložit síť jako těleso",
   "cmd.file_insert_step": "Vložit STEP",
   "cmd.file_save_mesh": "Uložit jako síť",
   "cmd.file_slicers": "Nainstalované slicery",

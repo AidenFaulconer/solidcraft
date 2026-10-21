@@ -526,6 +526,7 @@
   "cmd.face_delete": "Șterge fața",
   "cmd.file_export": "Exportă",
   "cmd.file_insert_mesh": "Inserează plasă",
+  "cmd.file_insert_mesh_solid": "Inserează plasă ca solid",
   "cmd.file_insert_step": "Inserează STEP",
   "cmd.file_save_mesh": "Salvează ca plasă",
   "cmd.file_slicers": "Slicere instalate",

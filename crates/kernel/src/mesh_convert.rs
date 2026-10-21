@@ -7,12 +7,15 @@ use solidcraft_geom::{Loop2, Plane, Region2, Vec2, Vec3};
 
 use crate::{Body, KernelError, Result};
 
-const MAX_TRIANGLES: usize = 50_000;
+pub(crate) const MAX_CONVERT_TRIANGLES: usize = 50_000;
+const MAX_TRIANGLES: usize = MAX_CONVERT_TRIANGLES;
 const MAX_BOUNDARY: usize = 8192;
 /// Nesting certification runs two planar booleans per pair of boundary loops,
 /// so the loop count (not the segment count) bounds its cost: 50 loops (an
 /// outline with 49 holes) is at most 1225 pairs and 2450 booleans.
 const MAX_LOOPS: usize = 50;
+/// Default normal-angle budget (radians) for analytic region growing (~15°).
+const DEFAULT_GROW_ANGLE: f64 = 15.0 * std::f64::consts::PI / 180.0;
 
 fn invalid(message: &str) -> KernelError {
     KernelError::Invalid(format!("mesh conversion: {message}"))
@@ -26,6 +29,19 @@ fn over_budget(triangles: usize) -> KernelError {
     ))
 }
 
+/// Reconstruct a closed mesh as an editable solid: try general analytic recognition
+/// (planes, cylinders, spheres), then the constant-section prismatic path, then a
+/// last-resort planar-faceted sew that preserves volume for freeform meshes.
+pub fn convert_mesh(body: &Body, tolerance: f64) -> Result<Body> {
+    match crate::mesh_recognize::convert_analytic_mesh(body, tolerance, DEFAULT_GROW_ANGLE) {
+        Ok(b) => Ok(b),
+        Err(analytic_err) => match convert_prismatic_mesh(body, tolerance) {
+            Ok(b) => Ok(b),
+            Err(_) => crate::mesh_recognize::convert_faceted_mesh(body, tolerance).map_err(|_| analytic_err),
+        },
+    }
+}
+
 /// Reconstruct a constant-section mesh as analytic planes and, where certified
 /// within `tolerance` mm, circular cylinders. The source mesh is not modified.
 /// Unsupported shapes are refused instead of silently returning a faceted solid.
@@ -35,7 +51,7 @@ pub fn convert_prismatic_mesh(body: &Body, tolerance: f64) -> Result<Body> {
             return Err(invalid("tolerance must be between 0.000001 and 1 mm"));
         }
         let input = body.mesh.as_ref().ok_or_else(|| invalid("select a mesh body"))?;
-        let welded = weld(input, tolerance)?;
+        let welded = weld_mesh(input, tolerance)?;
         let mesh = welded.mesh.as_ref().ok_or_else(|| invalid("empty mesh"))?;
         if mesh.triangles.len() > MAX_TRIANGLES {
             return Err(over_budget(mesh.triangles.len()));
@@ -76,7 +92,7 @@ pub fn convert_prismatic_mesh(body: &Body, tolerance: f64) -> Result<Body> {
     })
 }
 
-fn weld(mesh: &crate::meshbody::TriMesh, tolerance: f64) -> Result<Body> {
+pub(crate) fn weld_mesh(mesh: &crate::meshbody::TriMesh, tolerance: f64) -> Result<Body> {
     if mesh.triangles.len() > MAX_TRIANGLES {
         return Err(over_budget(mesh.triangles.len()));
     }
@@ -471,7 +487,7 @@ mod tests {
         assert!(convert_prismatic_mesh(&mesh_of(&sphere), 0.05).is_err());
         for coordinate in [f64::NAN, f64::INFINITY, f64::MAX, 1e30] {
             let mesh = crate::meshbody::TriMesh { positions: vec![Vec3::new(coordinate, 0., 0.)], triangles: vec![] };
-            assert!(weld(&mesh, 0.05).is_err());
+            assert!(weld_mesh(&mesh, 0.05).is_err());
         }
     }
 
@@ -487,7 +503,7 @@ mod tests {
         assert!(err.contains("50001 triangles") && err.contains("50000"), "{err}");
         assert!(err.contains("constant-section") && err.contains("freeform"), "{err}");
         let mesh = crate::meshbody::TriMesh { positions: vec![Vec3::ZERO; MAX_TRIANGLES * 3 + 1], triangles: vec![] };
-        let err = weld(&mesh, 0.05).unwrap_err().to_string();
+        let err = weld_mesh(&mesh, 0.05).unwrap_err().to_string();
         assert!(err.contains("150001 vertices") && err.contains("150000"), "{err}");
     }
 

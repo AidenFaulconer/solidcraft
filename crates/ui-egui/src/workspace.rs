@@ -140,8 +140,8 @@ pub const SECTIONS: &[Section] = &[
     Section {
         tab: "INSERT",
         panel: "FILES",
-        promoted: 3,
-        ids: &["file.insert_step", "file.insert_mesh", "component.insert_design", "file.save_mesh"],
+        promoted: 4,
+        ids: &["file.insert_step", "file.insert_mesh", "file.insert_mesh_solid", "component.insert_design", "file.save_mesh"],
     },
     Section { tab: "INSERT", panel: "IMAGES", promoted: 3, ids: &["canvas.insert", "canvas.decal", "canvas.edit"] },
     Section { tab: "INSERT", panel: "2D", promoted: 2, ids: &["sketch.insert_dxf", "sketch.insert_svg"] },

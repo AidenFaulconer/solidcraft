@@ -526,6 +526,7 @@
   "cmd.face_delete": "Usuń ścianę",
   "cmd.file_export": "Eksportuj",
   "cmd.file_insert_mesh": "Wstaw siatkę",
+  "cmd.file_insert_mesh_solid": "Wstaw siatkę jako bryłę",
   "cmd.file_insert_step": "Wstaw STEP",
   "cmd.file_save_mesh": "Zapisz jako siatkę",
   "cmd.file_slicers": "Zainstalowane slicery",

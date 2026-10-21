@@ -127,6 +127,8 @@ pub enum SurfSpec {
     /// same number of pieces, `a` and `b` running the same way; both chains lie on it as
     /// boundary edges.
     Ruled { a: EdgeSpec, b: EdgeSpec },
+    /// Sphere of `radius` about `center` (boundary edges must lie on it).
+    Sphere { center: Vec3, radius: f64 },
 }
 
 /// A face: boundary loops, surface, and a point on it with its outward normal (curved faces).
@@ -847,6 +849,26 @@ fn sew_impl(faces: &[FaceSpec], touching: bool, sources: Option<&[Option<crate::
                     }
                     let surface = mt::Surface::BSplineSurface(mt::BSplineSurface::homotopy(ca, cb));
                     curved(surface, wires, f.probe, fi)?
+                }
+                SurfSpec::Sphere { center, radius } => {
+                    if !radius.is_finite() || *radius <= 0.0 {
+                        return Err(KernelError::Invalid("sew: sphere radius".into()));
+                    }
+                    // Meridian arc through a pole pair, revolved a full turn (same construction
+                    // STEP import uses for SPHERICAL_SURFACE).
+                    let axis = f
+                        .probe
+                        .and_then(|(p, _)| (p - *center).normalized())
+                        .unwrap_or(Vec3::Z);
+                    let x = axis.any_perp();
+                    let (va, vb) = (
+                        builder::vertex(p3(*center - axis * *radius)),
+                        builder::vertex(p3(*center + axis * *radius)),
+                    );
+                    let mid = *center + x * *radius;
+                    let swept: mt::Shell = builder::rsweep(&arc_edge(&va, &vb, mid), p3(*center), v3(axis), mt::Rad(std::f64::consts::TAU));
+                    let tmp = swept.face_iter().next().cloned().ok_or_else(|| KernelError::Failed("sew: sphere surface".into()))?;
+                    curved(tmp.oriented_surface(), wires, f.probe, fi)?
                 }
             };
             out.push(face);

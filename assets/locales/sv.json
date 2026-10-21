@@ -526,6 +526,7 @@
   "cmd.face_delete": "Ta bort yta",
   "cmd.file_export": "Exportera",
   "cmd.file_insert_mesh": "Infoga mesh",
+  "cmd.file_insert_mesh_solid": "Infoga mesh som solid",
   "cmd.file_insert_step": "Infoga STEP",
   "cmd.file_save_mesh": "Spara som mesh",
   "cmd.file_slicers": "Installerade slicers",

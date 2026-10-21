@@ -526,6 +526,7 @@
   "cmd.face_delete": "Lap törlése",
   "cmd.file_export": "Exportálás",
   "cmd.file_insert_mesh": "Háló beszúrása",
+  "cmd.file_insert_mesh_solid": "Háló beszúrása szilárdtestként",
   "cmd.file_insert_step": "STEP beszúrása",
   "cmd.file_save_mesh": "Mentés hálóként",
   "cmd.file_slicers": "Telepített szeletelők",
