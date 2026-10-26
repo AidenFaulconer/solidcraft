@@ -214,6 +214,8 @@ crate::dialog_descriptor::dialog_descriptors! {
             /// An imported mesh body rebuilt as editable faces.
             MeshConvert {
                 tolerance: String,
+                /// How far a triangle normal may turn while a planar face grows.
+                angle: String,
                 /// Percent of triangles that may start a recognition region (1–100).
                 mesh: String,
                 cylinders: bool,
@@ -222,6 +224,21 @@ crate::dialog_descriptor::dialog_descriptors! {
                 spheres: bool,
                 threads: bool,
                 /// Keep triangles that are not an analytic face, as facets.
+                freeform: bool,
+            },
+            /// STL files on disk, one STEP file each. The open design is unchanged.
+            MeshConvertFiles {
+                path: String,
+                output: String,
+                recursive: bool,
+                tolerance: String,
+                angle: String,
+                mesh: String,
+                cylinders: bool,
+                cones: bool,
+                tori: bool,
+                spheres: bool,
+                threads: bool,
                 freeform: bool,
             },
             /// A construction axis, point or plane made from picks alone (#2474): input `i` is the
@@ -630,6 +647,7 @@ impl Dialog {
             "mesh.convert" => Dialog::new(
                 Kind::MeshConvert {
                     tolerance: "0.05 mm".into(),
+                    angle: "15 deg".into(),
                     mesh: "100 %".into(),
                     cylinders: true,
                     cones: true,
@@ -639,6 +657,23 @@ impl Dialog {
                     freeform: true,
                 },
                 vec![SelInput::new("Mesh body", BODIES, false)],
+            ),
+            "mesh.convert_files" => Dialog::new(
+                Kind::MeshConvertFiles {
+                    path: String::new(),
+                    output: String::new(),
+                    recursive: false,
+                    tolerance: "0.05 mm".into(),
+                    angle: "15 deg".into(),
+                    mesh: "100 %".into(),
+                    cylinders: true,
+                    cones: true,
+                    tori: true,
+                    spheres: true,
+                    threads: true,
+                    freeform: true,
+                },
+                Vec::new(),
             ),
             "construct.plane.midplane" => Dialog::new(
                 Kind::Midplane,
@@ -1584,6 +1619,7 @@ fn title(k: &Kind) -> &'static str {
         Kind::Material { .. } => "PHYSICAL MATERIAL",
         Kind::Midplane => "MIDPLANE",
         Kind::MeshConvert { .. } => "CONVERT MESH",
+        Kind::MeshConvertFiles { .. } => "CONVERT STL FOLDER",
         Kind::Construct { title, .. } => title,
         Kind::PathPlane { .. } => "PLANE ALONG PATH",
         Kind::Rib { web: false, .. } => "RIB",
@@ -3251,7 +3287,7 @@ fn dialog_commands(app: &SolveApp, d: &Dialog) -> Result<Vec<(String, Value)>, S
             let base = plane_arg(app, sels(d, 0).first())?;
             ("construct.plane.offset", json!({"base": base}))
         }
-        Kind::MeshConvert { tolerance, mesh, cylinders, cones, tori, spheres, threads, freeform } => {
+        Kind::MeshConvert { tolerance, angle, mesh, cylinders, cones, tori, spheres, threads, freeform } => {
             need(0, "the mesh body")?;
             let body = match sels(d, 0).first() {
                 Some(Sel::Body { name }) => name.clone(),
@@ -3260,8 +3296,19 @@ fn dialog_commands(app: &SolveApp, d: &Dialog) -> Result<Vec<(String, Value)>, S
             let mesh = mesh_percent(mesh)?;
             (
                 "mesh.convert",
-                json!({"body": body, "tolerance": tolerance, "mesh": mesh, "cylinders": cylinders, "cones": cones, "tori": tori, "spheres": spheres, "threads": threads, "freeform": freeform}),
+                json!({"body": body, "tolerance": tolerance, "angle": angle, "mesh": mesh, "cylinders": cylinders, "cones": cones, "tori": tori, "spheres": spheres, "threads": threads, "freeform": freeform}),
             )
+        }
+        Kind::MeshConvertFiles { path, output, recursive, tolerance, angle, mesh, cylinders, cones, tori, spheres, threads, freeform } => {
+            if path.trim().is_empty() {
+                return Err("choose an STL file or a folder".into());
+            }
+            let mesh = mesh_percent(mesh)?;
+            let mut params = json!({"path": path, "recursive": recursive, "tolerance": tolerance, "angle": angle, "mesh": mesh, "cylinders": cylinders, "cones": cones, "tori": tori, "spheres": spheres, "threads": threads, "freeform": freeform});
+            if !output.trim().is_empty() {
+                params["output"] = json!(output);
+            }
+            ("mesh.convert_files", params)
         }
         Kind::Midplane => {
             need(0, "the first plane")?;

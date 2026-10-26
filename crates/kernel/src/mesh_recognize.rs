@@ -268,6 +268,9 @@ pub(crate) fn convert_analytic_with(body: &Body, tolerance: f64, angle: f64, opt
         // apart. Snapping a shared vertex onto both leaves it on neither, and truck then
         // refuses the wire. Fold those patches back into one plane first.
         merge_coplanar_planes(mesh, &normals, &mut planes, tolerance);
+        // A triangle left beside a plane, but still within tolerance of it, becomes part of that
+        // plane. Emitted on its own, snapping flattens it and the shell no longer closes.
+        absorb_coplanar_triangles(mesh, &adj, &mut planes, &mut assigned, tolerance);
         let snapped = snapped_positions(mesh, &planes);
         // Caps look circles up by the rim's vertex set. A geometric fit misses once snapping
         // moves a rim point, and the cap then uses lines the wall does not have.
@@ -445,10 +448,17 @@ pub(crate) fn convert_analytic_with(body: &Body, tolerance: f64, angle: f64, opt
             }
         }
 
+        // A triangle snapped almost flat has no normal truck will accept, but its edges are
+        // already shared. Fold it into the neighbour across the long edge so the shell still closes.
+        fold_sliver_triangles(&mut faces, &mut origins);
+
         // Try sewing with curved faces; if the shell will not close, demote curved
         // clusters to per-triangle planar facets and sew a faceted solid instead.
         let mut attempt = faces.clone();
         attempt.extend(curved.iter().cloned());
+        // Snapping onto two planes leaves one shared corner a few hundredths of a micrometre
+        // apart. That is enough for the edge not to be shared, so the shell stays open.
+        unify_near_corners(&mut attempt, 3e-5);
         if attempt.len() < 4 {
             return Err(invalid("not enough faces to close a solid"));
         }
@@ -479,6 +489,9 @@ pub(crate) fn convert_analytic_with(body: &Body, tolerance: f64, angle: f64, opt
                     }
                     let (once, over, unique) = boundary_uses(&attempt);
                     eprintln!("diag edges once={once} over={over} unique={unique}");
+                    for (a, b) in once_edge_samples(&attempt, 12) {
+                        eprintln!("diag once ({:.5},{:.5},{:.5})-({:.5},{:.5},{:.5})", a.x, a.y, a.z, b.x, b.y, b.z);
+                    }
                 }
                 Err(invalid(&format!("sew failed (planar-only): {e}")))
             }
@@ -1154,6 +1167,184 @@ fn on_plane(p: Vec3, n: Vec3, d: f64) -> bool {
     (p.dot(n) - d).abs() <= TRUCK_FLAT
 }
 
+fn fold_sliver_triangles(faces: &mut Vec<FaceSpec>, origins: &mut Vec<Vec<usize>>) {
+    let mut skip = 0usize;
+    for _ in 0..64 {
+        let Some(rel) = faces.iter().skip(skip).position(is_sliver_triangle) else { break };
+        let si = skip + rel;
+        if fold_one_sliver(faces, origins, si) {
+            skip = 0;
+        } else {
+            skip = si + 1;
+        }
+    }
+}
+
+fn fold_one_sliver(faces: &mut Vec<FaceSpec>, origins: &mut Vec<Vec<usize>>, si: usize) -> bool {
+    let Some(edges) = faces.get(si).and_then(|face| face.loops.first()).filter(|lp| lp.len() == 3).cloned() else {
+        return false;
+    };
+    let mut long = 0usize;
+    let mut long_len = -1.0_f64;
+    for (i, edge) in edges.iter().enumerate() {
+        let Some((a, b)) = line_ends(edge) else { return false };
+        let len = a.dist(b);
+        if len > long_len {
+            long = i;
+            long_len = len;
+        }
+    }
+    let Some((a, b)) = line_ends(&edges[long]) else { return false };
+    let (ka, kb) = (quant_pt(a), quant_pt(b));
+    let mut host: Option<(usize, usize, usize, bool)> = None;
+    for (fi, face) in faces.iter().enumerate() {
+        if fi == si {
+            continue;
+        }
+        for (li, lp) in face.loops.iter().enumerate() {
+            for (ei, edge) in lp.iter().enumerate() {
+                let Some((c, d)) = line_ends(edge) else { continue };
+                let (kc, kd) = (quant_pt(c), quant_pt(d));
+                if kc == kb && kd == ka {
+                    host = Some((fi, li, ei, false));
+                } else if kc == ka && kd == kb {
+                    host = Some((fi, li, ei, true));
+                }
+            }
+        }
+    }
+    let Some((fi, li, ei, same_dir)) = host else { return false };
+    let n = edges.len();
+    let mut bridge: Vec<EdgeSpec> = (1..n).map(|k| edges[(long + k) % n].clone()).collect();
+    if same_dir {
+        reverse_loop(&mut bridge);
+    }
+    let Some(lp) = faces.get_mut(fi).and_then(|face| face.loops.get_mut(li)) else { return false };
+    if ei >= lp.len() || lp.len() + bridge.len() > MAX_LOOP_EDGES {
+        return false;
+    }
+    lp.splice(ei..=ei, bridge);
+    faces.remove(si);
+    if si < origins.len() {
+        origins.remove(si);
+    }
+    true
+}
+
+fn is_sliver_triangle(face: &FaceSpec) -> bool {
+    let Some(lp) = face.loops.first() else { return false };
+    if face.loops.len() != 1 || lp.len() != 3 {
+        return false;
+    }
+    let mut pts = [Vec3::ZERO; 3];
+    for (i, edge) in lp.iter().enumerate() {
+        let Some((a, _)) = line_ends(edge) else { return false };
+        pts[i] = a;
+    }
+    (pts[1] - pts[0]).cross(pts[2] - pts[0]).len() < 1.5e-6
+}
+
+fn line_ends(edge: &EdgeSpec) -> Option<(Vec3, Vec3)> {
+    match edge {
+        EdgeSpec::Line { a, b } => Some((*a, *b)),
+        _ => None,
+    }
+}
+
+fn unify_near_corners(faces: &mut [FaceSpec], tol: f64) {
+    if !(tol.is_finite() && tol > 0.0) {
+        return;
+    }
+    let mut reps: Vec<Vec3> = Vec::new();
+    let mut bins: HashMap<(i64, i64, i64), Vec<usize>> = HashMap::new();
+    let key = |p: Vec3| ((p.x / tol).round() as i64, (p.y / tol).round() as i64, (p.z / tol).round() as i64);
+    let mut remember = |p: Vec3| {
+        let k = key(p);
+        for dz in -1i64..=1 {
+            for dy in -1i64..=1 {
+                for dx in -1i64..=1 {
+                    let Some(ids) = bins.get(&(k.0 + dx, k.1 + dy, k.2 + dz)) else { continue };
+                    for &id in ids {
+                        if reps.get(id).is_some_and(|r| r.dist(p) <= tol) {
+                            return;
+                        }
+                    }
+                }
+            }
+        }
+        let id = reps.len();
+        reps.push(p);
+        bins.entry(k).or_default().push(id);
+    };
+    for face in faces.iter() {
+        for edge in face.loops.iter().flatten() {
+            match edge {
+                EdgeSpec::Line { a, b } | EdgeSpec::Arc { a, b, .. } => {
+                    remember(*a);
+                    remember(*b);
+                }
+                EdgeSpec::Chain { ctrl, .. } => {
+                    if let Some(a) = ctrl.first() {
+                        remember(*a);
+                    }
+                    if let Some(b) = ctrl.last() {
+                        remember(*b);
+                    }
+                }
+            }
+        }
+    }
+    let canon = |p: Vec3| -> Vec3 {
+        let k = key(p);
+        let mut best: Option<Vec3> = None;
+        let mut best_d = tol;
+        for dz in -1i64..=1 {
+            for dy in -1i64..=1 {
+                for dx in -1i64..=1 {
+                    let Some(ids) = bins.get(&(k.0 + dx, k.1 + dy, k.2 + dz)) else { continue };
+                    for &id in ids {
+                        let Some(r) = reps.get(id) else { continue };
+                        let d = r.dist(p);
+                        if d <= best_d {
+                            best = Some(*r);
+                            best_d = d;
+                        }
+                    }
+                }
+            }
+        }
+        best.unwrap_or(p)
+    };
+    for face in faces.iter_mut() {
+        for edge in face.loops.iter_mut().flatten() {
+            match edge {
+                EdgeSpec::Line { a, b } => {
+                    *a = canon(*a);
+                    *b = canon(*b);
+                }
+                EdgeSpec::Arc { a, b, .. } => {
+                    *a = canon(*a);
+                    *b = canon(*b);
+                }
+                EdgeSpec::Chain { ctrl, .. } => {
+                    let mut c = ctrl.to_vec();
+                    if let Some(a) = c.first_mut() {
+                        *a = canon(*a);
+                    }
+                    if let Some(b) = c.last_mut() {
+                        *b = canon(*b);
+                    }
+                    *ctrl = c.into();
+                }
+            }
+        }
+    }
+}
+
+fn quant_pt(p: Vec3) -> (i64, i64, i64) {
+    ((p.x * 1e6).round() as i64, (p.y * 1e6).round() as i64, (p.z * 1e6).round() as i64)
+}
+
 /// Truck refuses a plane when the boundary normal vanishes or a point is more than 1e-6 mm off.
 /// Arcs stay: their control points are not the geometric midpoint, and a cap must keep them.
 fn face_not_a_plane(face: &FaceSpec) -> bool {
@@ -1216,6 +1407,28 @@ fn boundary_uses(faces: &[FaceSpec]) -> (usize, usize, usize) {
     (once, over, uses.len())
 }
 
+#[cfg(test)]
+fn once_edge_samples(faces: &[FaceSpec], limit: usize) -> Vec<(Vec3, Vec3)> {
+    let q = |p: Vec3| ((p.x * 1e6).round() as i64, (p.y * 1e6).round() as i64, (p.z * 1e6).round() as i64);
+    let mut uses: HashMap<(i64, i64, i64, i64, i64, i64), (usize, Vec3, Vec3)> = HashMap::new();
+    for face in faces {
+        for edge in face.loops.iter().flatten() {
+            let (a, b) = match edge {
+                EdgeSpec::Line { a, b } | EdgeSpec::Arc { a, b, .. } => (*a, *b),
+                EdgeSpec::Chain { ctrl, .. } => (ctrl.first().copied().unwrap_or(Vec3::ZERO), ctrl.last().copied().unwrap_or(Vec3::ZERO)),
+            };
+            let (mut ka, mut kb, mut pa, mut pb) = (q(a), q(b), a, b);
+            if kb < ka {
+                std::mem::swap(&mut ka, &mut kb);
+                std::mem::swap(&mut pa, &mut pb);
+            }
+            let slot = uses.entry((ka.0, ka.1, ka.2, kb.0, kb.1, kb.2)).or_insert((0, pa, pb));
+            slot.0 += 1;
+        }
+    }
+    uses.values().filter(|(c, _, _)| *c == 1).take(limit).map(|(_, a, b)| (*a, *b)).collect()
+}
+
 fn edges_on_plane(edges: &[EdgeSpec], n: Vec3, d: f64) -> bool {
     edges.iter().all(|e| match e {
         EdgeSpec::Line { a, b } => on_plane(*a, n, d) && on_plane(*b, n, d),
@@ -1241,20 +1454,9 @@ fn planar_face(
     // manifold triangulated shell sews without inventing gaps at shared edges.
     if let [ti] = *cluster {
         let tri = mesh.triangles.get(ti).ok_or_else(|| invalid("missing triangle"))?;
-        let (Some(mut a), Some(mut b), Some(mut c)) = (at(tri[0]), at(tri[1]), at(tri[2])) else {
+        let (Some(a), Some(b), Some(c)) = (at(tri[0]), at(tri[1]), at(tri[2])) else {
             return Err(invalid("missing vertex"));
         };
-        // Snapping a corner onto several planes can flatten a triangle until truck finds no normal.
-        if (b - a).cross(c - a).len() < 1e-6 {
-            let orig = |i: u32| mesh.positions.get(i as usize).copied();
-            if let (Some(oa), Some(ob), Some(oc)) = (orig(tri[0]), orig(tri[1]), orig(tri[2]))
-                && (ob - oa).cross(oc - oa).len() >= 1e-6
-            {
-                a = oa;
-                b = ob;
-                c = oc;
-            }
-        }
         let edges = vec![EdgeSpec::Line { a, b }, EdgeSpec::Line { a: b, b: c }, EdgeSpec::Line { a: c, b: a }];
         return Ok(FaceSpec { loops: vec![edges], surface: SurfSpec::Plane, probe: None });
     }
@@ -1621,6 +1823,61 @@ fn cluster_on_plane(mesh: &TriMesh, cluster: &[usize], n: Vec3, d: f64, toleranc
             .get(ti)
             .is_some_and(|tri| tri.iter().all(|&vi| mesh.positions.get(vi as usize).is_some_and(|p| (p.dot(n) - d).abs() <= tolerance)))
     })
+}
+
+/// Pull unassigned triangles that share an edge with a plane, and lie within `tolerance` of it,
+/// into that plane. Several rounds, so a strip of slivers can follow the first one in.
+fn absorb_coplanar_triangles(mesh: &TriMesh, adj: &[Vec<usize>], planes: &mut [HeldPlane], assigned: &mut [bool], tolerance: f64) {
+    let mut owner = vec![None; mesh.triangles.len()];
+    for (pi, plane) in planes.iter().enumerate() {
+        for &t in &plane.cluster {
+            if let Some(slot) = owner.get_mut(t) {
+                *slot = Some(pi);
+            }
+        }
+    }
+    for _ in 0..8 {
+        let mut added: Vec<(usize, usize)> = Vec::new();
+        for ti in 0..mesh.triangles.len() {
+            if assigned.get(ti).copied().unwrap_or(true) {
+                continue;
+            }
+            let Some(tri) = mesh.triangles.get(ti) else { continue };
+            let mut votes: Vec<(usize, usize)> = Vec::new();
+            for &nb in adj.get(ti).into_iter().flatten() {
+                let Some(Some(pi)) = owner.get(nb).copied() else { continue };
+                if let Some((_, count)) = votes.iter_mut().find(|(plane, _)| *plane == pi) {
+                    *count += 1;
+                } else {
+                    votes.push((pi, 1));
+                }
+            }
+            // Most shared edges, then the earlier plane, so the choice does not depend on hash order.
+            let Some(&(pi, _)) = votes.iter().max_by(|a, b| a.1.cmp(&b.1).then(b.0.cmp(&a.0))) else { continue };
+            let Some(plane) = planes.get(pi) else { continue };
+            let on_plane = tri.iter().all(|&vi| mesh.positions.get(vi as usize).is_some_and(|p| (p.dot(plane.n) - plane.d).abs() <= tolerance));
+            if on_plane {
+                added.push((pi, ti));
+            }
+        }
+        if added.is_empty() {
+            break;
+        }
+        for (pi, ti) in added {
+            if assigned.get(ti).copied().unwrap_or(true) {
+                continue;
+            }
+            if let Some(plane) = planes.get_mut(pi) {
+                plane.cluster.push(ti);
+            }
+            if let Some(slot) = assigned.get_mut(ti) {
+                *slot = true;
+            }
+            if let Some(slot) = owner.get_mut(ti) {
+                *slot = Some(pi);
+            }
+        }
+    }
 }
 
 /// Join plane patches that share an edge and lie within the conversion tolerance, so snapping

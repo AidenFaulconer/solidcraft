@@ -535,6 +535,14 @@ fn is_on(value: &bool) -> bool {
     *value
 }
 
+fn default_mesh_angle() -> Expr {
+    Expr::new("15 deg")
+}
+
+fn is_default_mesh_angle(value: &Expr) -> bool {
+    value.as_str() == "15 deg"
+}
+
 /// Feature definitions.
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize, solidcraft_derive::Walk)]
 #[serde(tag = "type", rename_all = "snake_case")]
@@ -1610,6 +1618,11 @@ pub enum FeatureKind {
         body: BodyName,
         #[walk(length = "Tolerance")]
         tolerance: Expr,
+        /// How far a triangle normal may turn while a planar face grows. Missing in older
+        /// designs, which keep the 15° budget.
+        #[walk(angle = "Angle")]
+        #[serde(default = "default_mesh_angle", skip_serializing_if = "is_default_mesh_angle")]
+        angle: Expr,
         #[serde(default = "full_mesh_percent", skip_serializing_if = "is_full_mesh_percent")]
         mesh: f64,
         #[serde(default = "recognition_on", skip_serializing_if = "is_on")]

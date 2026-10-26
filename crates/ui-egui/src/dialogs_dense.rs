@@ -38,6 +38,7 @@ pub(super) fn command(kind: &Kind) -> Option<&'static str> {
         Kind::Sweep { .. } => Some("solid.sweep"),
         Kind::Midplane => Some("construct.plane.midplane"),
         Kind::MeshConvert { .. } => Some("mesh.convert"),
+        Kind::MeshConvertFiles { .. } => Some("mesh.convert_files"),
         Kind::Construct { command, .. } => Some(command),
         Kind::PathPlane { .. } => Some("construct.plane.along_path"),
         Kind::Split => Some("solid.split_body"),
@@ -646,13 +647,23 @@ fn additional_rows(app: &mut SolveApp, d: &mut Dialog, ui: &mut egui::Ui) -> boo
         Kind::PathPlane { t, .. } => {
             enter |= expr_row(ui, "Position (0 to 1)", t);
         }
-        Kind::MeshConvert { tolerance, mesh, cylinders, cones, tori, spheres, threads, freeform } => {
+        Kind::MeshConvert { tolerance, angle, mesh, cylinders, cones, tori, spheres, threads, freeform } => {
             form_row(ui, "Tolerance", |ui| enter |= field(ui, tolerance));
+            form_row(ui, "Angle", |ui| enter |= field(ui, angle));
             form_row(ui, "Mesh", |ui| enter |= field(ui, mesh));
-            ui_kit::section(ui, "mesh_recognition", "Recognition", true, |ui| {
+            recognition_rows(ui, cylinders, cones, tori, spheres, threads, freeform);
+        }
+        Kind::MeshConvertFiles { path, output, recursive, tolerance, angle, mesh, cylinders, cones, tori, spheres, threads, freeform } => {
+            form_row(ui, "Folder", |ui| enter |= field(ui, path));
+            form_row(ui, "Output", |ui| enter |= field(ui, output));
+            form_row(ui, "Tolerance", |ui| enter |= field(ui, tolerance));
+            form_row(ui, "Angle", |ui| enter |= field(ui, angle));
+            form_row(ui, "Mesh", |ui| enter |= field(ui, mesh));
+            ui_kit::section(ui, "mesh_files", "Recognition", true, |ui| {
                 ui_kit::checkbox_grid(
                     ui,
                     &mut [
+                        ("Recursive", recursive),
                         ("Cylinders", cylinders),
                         ("Cones", cones),
                         ("Tori", tori),
@@ -662,10 +673,7 @@ fn additional_rows(app: &mut SolveApp, d: &mut Dialog, ui: &mut egui::Ui) -> boo
                     ],
                     2,
                 );
-                ui.add(
-                    egui::Label::new("Planes are always fitted. Cones, tori and threads stay with those faces until a fitter for them exists. Freeform keeps whatever is left as facets.")
-                        .wrap(),
-                );
+                recognition_note(ui);
             });
         }
         Kind::Construct { t: Some(t), .. } => {
@@ -817,6 +825,34 @@ fn additional_rows(app: &mut SolveApp, d: &mut Dialog, ui: &mut egui::Ui) -> boo
         _ => {}
     }
     enter
+}
+
+fn recognition_rows(
+    ui: &mut egui::Ui,
+    cylinders: &mut bool,
+    cones: &mut bool,
+    tori: &mut bool,
+    spheres: &mut bool,
+    threads: &mut bool,
+    freeform: &mut bool,
+) {
+    ui_kit::section(ui, "mesh_recognition", "Recognition", true, |ui| {
+        ui_kit::checkbox_grid(
+            ui,
+            &mut [("Cylinders", cylinders), ("Cones", cones), ("Tori", tori), ("Spheres", spheres), ("Threads", threads), ("Freeform", freeform)],
+            2,
+        );
+        recognition_note(ui);
+    });
+}
+
+fn recognition_note(ui: &mut egui::Ui) {
+    ui.add(
+        egui::Label::new(
+            "Planes are always fitted. Angle is how far a triangle normal may turn while a face grows; 2 deg keeps fine louvers apart. Cones, tori and threads stay with those faces until a fitter for them exists. Freeform keeps whatever is left as facets.",
+        )
+        .wrap(),
+    );
 }
 
 fn fmt_mm(app: &SolveApp, v: &Value) -> String {

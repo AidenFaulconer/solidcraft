@@ -79,6 +79,9 @@ fn representative(h: &Harness, command: &str) -> Dialog {
     if let Kind::Thread { designation, .. } = &mut d.kind {
         *designation = "M20x2.5".into();
     }
+    if let Kind::MeshConvertFiles { path, .. } = &mut d.kind {
+        *path = "part.stl".into();
+    }
     if let Kind::Assembly(crate::dialogs_assembly::Asm::Cam(f)) = &mut d.kind {
         f.b = s.doc.assembly.joints[2].id;
     }
@@ -145,6 +148,7 @@ fn check_form(command: &str, labels: &[&str]) {
         "surface.untrim" => &["Restore outer boundary", "In place (surfaces)"],
         "component.create" => &["Activate"],
         "mesh.convert" => &["Cylinders", "Cones", "Tori", "Spheres", "Threads", "Freeform"],
+        "mesh.convert_files" => &["Recursive", "Cylinders", "Cones", "Tori", "Spheres", "Threads", "Freeform"],
         "joint.gear" => &["Reverse", "Internal gear"],
         "joint.rack_pinion" | "joint.screw" => &["Reverse"],
         "joint.cam" => &["Other side"],
@@ -215,7 +219,8 @@ form_case!(loft, "solid.loft", ["Operation"]);
 form_case!(sweep, "solid.sweep", ["Orientation"]);
 form_case!(offset_plane, "construct.plane.offset", ["Distance"]);
 form_case!(midplane, "construct.plane.midplane", []);
-form_case!(mesh_convert, "mesh.convert", ["Tolerance", "Mesh"]);
+form_case!(mesh_convert, "mesh.convert", ["Tolerance", "Angle", "Mesh"]);
+form_case!(mesh_convert_files, "mesh.convert_files", ["Folder", "Output", "Tolerance", "Angle", "Mesh"]);
 form_case!(axis_two_planes, "construct.axis.two_planes", []);
 form_case!(point_along_path, "construct.point.along_path", ["Position (0 to 1)"]);
 form_case!(angle_plane, "construct.plane.at_angle", ["Angle"]);

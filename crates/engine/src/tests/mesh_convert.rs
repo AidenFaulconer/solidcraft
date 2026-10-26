@@ -264,15 +264,15 @@ fn mesh_convert_records_recognition_choices() {
     run(
         &mut s,
         "mesh.convert",
-        json!({"body":"Mesh","tolerance":"0.01 mm","mesh":80,"cylinders":false,"cones":false,"tori":false,"spheres":false,"threads":false,"freeform":true}),
+        json!({"body":"Mesh","tolerance":"0.01 mm","angle":"2 deg","mesh":80,"cylinders":false,"cones":false,"tori":false,"spheres":false,"threads":false,"freeform":true}),
     );
     let kind = s.doc.features.iter().find_map(|f| match &f.kind {
-        FeatureKind::MeshConvert { mesh, cylinders, cones, tori, spheres, threads, freeform, .. } => {
-            Some((*mesh, *cylinders, *cones, *tori, *spheres, *threads, *freeform))
+        FeatureKind::MeshConvert { angle, mesh, cylinders, cones, tori, spheres, threads, freeform, .. } => {
+            Some((angle.as_str().to_string(), *mesh, *cylinders, *cones, *tori, *spheres, *threads, *freeform))
         }
         _ => None,
     });
-    assert_eq!(kind, Some((80.0, false, false, false, false, false, true)));
+    assert_eq!(kind, Some(("2 deg".into(), 80.0, false, false, false, false, false, true)));
     assert!(!s.model.state().body("Mesh").unwrap().body.is_mesh());
     assert!(s.execute("mesh.convert", &json!({"body":"Mesh","mesh":0})).is_err());
 }
@@ -282,4 +282,31 @@ fn installed_slicers_are_listed() {
     let mut s = imported_box();
     let r = s.execute("file.slicers", &json!({})).unwrap();
     assert!(r["slicers"].is_array());
+}
+
+#[test]
+fn convert_files_writes_one_step_per_stl_and_leaves_the_design() {
+    let mut s = Session::default();
+    run(&mut s, "solid.box", json!({"length": 10, "width": 20, "height": 30, "operation": "new", "body_name": "Stock"}));
+    let dir = std::env::temp_dir().join(format!("solidcraft-stl-folder-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&dir);
+    std::fs::create_dir_all(dir.join("nested")).unwrap();
+    let stl = dir.join("a.stl");
+    run(&mut s, "file.save_mesh", json!({"path": &stl, "bodies": ["Stock"]}));
+    std::fs::copy(&stl, dir.join("nested").join("b.stl")).unwrap();
+    std::fs::write(dir.join("note.txt"), b"not a mesh").unwrap();
+    let out = dir.join("step");
+    std::fs::create_dir_all(&out).unwrap();
+    let features = s.doc.features.len();
+    let flat = s.execute("mesh.convert_files", &json!({"path": &dir, "output": &out, "angle": "15 deg"})).unwrap();
+    assert_eq!(flat["written"].as_array().map(Vec::len), Some(1), "{flat}");
+    assert_eq!(s.doc.features.len(), features);
+    let step = std::fs::read(out.join("a.step")).unwrap();
+    assert!(step.windows(12).any(|window| window == b"ISO-10303-21"), "STEP header missing");
+    let both = s.execute("mesh.convert_files", &json!({"path": &dir, "output": &out, "recursive": true})).unwrap();
+    assert_eq!(both["written"].as_array().map(Vec::len), Some(2), "{both}");
+    assert!(out.join("b.step").is_file());
+    assert!(s.execute("mesh.convert_files", &json!({"path": dir.join("note.txt")})).is_err());
+    assert!(s.execute("mesh.convert_files", &json!({})).is_err());
+    let _ = std::fs::remove_dir_all(&dir);
 }

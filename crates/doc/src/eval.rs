@@ -5837,8 +5837,9 @@ fn eval_feature(doc: &Document, vals: &BTreeMap<String, Value>, f: &Feature, st:
             }
             Ok(())
         }
-        FeatureKind::MeshConvert { body, tolerance, mesh, cylinders, cones, tori, spheres, threads, freeform } => {
+        FeatureKind::MeshConvert { body, tolerance, angle, mesh, cylinders, cones, tori, spheres, threads, freeform } => {
             let tolerance = val(vals, tolerance, Kind::Length)?;
+            let angle = val(vals, angle, Kind::Angle)?;
             let index = st.bodies.iter().position(|b| &b.name == body).ok_or_else(|| DocError::Unknown(format!("body `{body}`")))?;
             let source = st.bodies.get(index).ok_or_else(|| DocError::Unknown(format!("body `{body}`")))?;
             if doc.model_body_component(source) != f.component {
@@ -5848,6 +5849,7 @@ fn eval_feature(doc: &Document, vals: &BTreeMap<String, Value>, f: &Feature, st:
                 &source.body,
                 &kernel::ConvertOptions {
                     tolerance,
+                    angle,
                     mesh_percent: *mesh,
                     cylinders: *cylinders,
                     cones: *cones,

@@ -35,6 +35,8 @@ fn over_budget(triangles: usize) -> KernelError {
 #[derive(Clone, Copy, Debug)]
 pub struct ConvertOptions {
     pub tolerance: f64,
+    /// Maximum normal deviation (radians) while a planar region grows.
+    pub angle: f64,
     pub mesh_percent: f64,
     pub cylinders: bool,
     pub cones: bool,
@@ -47,7 +49,17 @@ pub struct ConvertOptions {
 
 impl ConvertOptions {
     pub fn from_tolerance(tolerance: f64) -> Self {
-        Self { tolerance, mesh_percent: 100.0, cylinders: true, cones: true, tori: true, spheres: true, threads: true, freeform: true }
+        Self {
+            tolerance,
+            angle: DEFAULT_GROW_ANGLE,
+            mesh_percent: 100.0,
+            cylinders: true,
+            cones: true,
+            tori: true,
+            spheres: true,
+            threads: true,
+            freeform: true,
+        }
     }
 }
 
@@ -71,9 +83,9 @@ pub fn convert_mesh_with(body: &Body, options: &ConvertOptions) -> Result<Body> 
         mesh_fraction: fraction,
     };
     let analytic = if recognize == crate::mesh_recognize::RecognizeOptions::default() {
-        crate::mesh_recognize::convert_analytic_mesh(body, tolerance, DEFAULT_GROW_ANGLE)
+        crate::mesh_recognize::convert_analytic_mesh(body, tolerance, options.angle)
     } else {
-        crate::mesh_recognize::convert_analytic_with(body, tolerance, DEFAULT_GROW_ANGLE, &recognize)
+        crate::mesh_recognize::convert_analytic_with(body, tolerance, options.angle, &recognize)
     };
     match analytic {
         Ok(b) => Ok(b),
