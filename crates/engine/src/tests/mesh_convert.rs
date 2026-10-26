@@ -259,6 +259,25 @@ fn save_mesh_writes_stl_and_3mf() {
 }
 
 #[test]
+fn mesh_convert_records_recognition_choices() {
+    let mut s = imported_box();
+    run(
+        &mut s,
+        "mesh.convert",
+        json!({"body":"Mesh","tolerance":"0.01 mm","mesh":80,"cylinders":false,"cones":false,"tori":false,"spheres":false,"threads":false,"freeform":true}),
+    );
+    let kind = s.doc.features.iter().find_map(|f| match &f.kind {
+        FeatureKind::MeshConvert { mesh, cylinders, cones, tori, spheres, threads, freeform, .. } => {
+            Some((*mesh, *cylinders, *cones, *tori, *spheres, *threads, *freeform))
+        }
+        _ => None,
+    });
+    assert_eq!(kind, Some((80.0, false, false, false, false, false, true)));
+    assert!(!s.model.state().body("Mesh").unwrap().body.is_mesh());
+    assert!(s.execute("mesh.convert", &json!({"body":"Mesh","mesh":0})).is_err());
+}
+
+#[test]
 fn installed_slicers_are_listed() {
     let mut s = imported_box();
     let r = s.execute("file.slicers", &json!({})).unwrap();

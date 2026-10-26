@@ -144,6 +144,7 @@ fn check_form(command: &str, labels: &[&str]) {
         "surface.ruled" => &["Flip"],
         "surface.untrim" => &["Restore outer boundary", "In place (surfaces)"],
         "component.create" => &["Activate"],
+        "mesh.convert" => &["Cylinders", "Cones", "Tori", "Spheres", "Threads", "Freeform"],
         "joint.gear" => &["Reverse", "Internal gear"],
         "joint.rack_pinion" | "joint.screw" => &["Reverse"],
         "joint.cam" => &["Other side"],
@@ -214,7 +215,7 @@ form_case!(loft, "solid.loft", ["Operation"]);
 form_case!(sweep, "solid.sweep", ["Orientation"]);
 form_case!(offset_plane, "construct.plane.offset", ["Distance"]);
 form_case!(midplane, "construct.plane.midplane", []);
-form_case!(mesh_convert, "mesh.convert", ["Tolerance"]);
+form_case!(mesh_convert, "mesh.convert", ["Tolerance", "Mesh"]);
 form_case!(axis_two_planes, "construct.axis.two_planes", []);
 form_case!(point_along_path, "construct.point.along_path", ["Position (0 to 1)"]);
 form_case!(angle_plane, "construct.plane.at_angle", ["Angle"]);

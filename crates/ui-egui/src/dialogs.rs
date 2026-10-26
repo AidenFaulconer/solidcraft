@@ -211,9 +211,18 @@ crate::dialog_descriptor::dialog_descriptors! {
             },
             /// Halfway between two planes or planar faces.
             Midplane,
-            /// An imported mesh body rebuilt as editable faces (#3001).
+            /// An imported mesh body rebuilt as editable faces.
             MeshConvert {
                 tolerance: String,
+                /// Percent of triangles that may start a recognition region (1–100).
+                mesh: String,
+                cylinders: bool,
+                cones: bool,
+                tori: bool,
+                spheres: bool,
+                threads: bool,
+                /// Keep triangles that are not an analytic face, as facets.
+                freeform: bool,
             },
             /// A construction axis, point or plane made from picks alone (#2474): input `i` is the
             /// command's parameter `keys[i]`, and `t` (along a path) when it takes one.
@@ -357,6 +366,8 @@ crate::dialog_descriptor::dialog_descriptors! {
             Motion(crate::dialogs_motion::Mo),
             /// Insert Part from the standard parts library (`dialogs_parts`).
             Part(crate::dialogs_parts::Pt),
+            /// OpenSCAD library: pick a script, set its customizer parameters, insert the mesh.
+            Scad(crate::dialogs_scad::Dlg),
             PartSize(crate::dialogs_part_size::Resize),
             /// Edit Text: a sketch text's content and placement (`sketch_text`).
             Text(Box<crate::sketch_text::Tx>),
@@ -616,7 +627,19 @@ impl Dialog {
                 Kind::PathPattern { count: "4".into(), spacing: "20 mm".into() },
                 vec![SelInput::new("Objects", BODIES, true), SelInput::new("Path", CURVES, true)],
             ),
-            "mesh.convert" => Dialog::new(Kind::MeshConvert { tolerance: "0.05 mm".into() }, vec![SelInput::new("Mesh body", BODIES, false)]),
+            "mesh.convert" => Dialog::new(
+                Kind::MeshConvert {
+                    tolerance: "0.05 mm".into(),
+                    mesh: "100 %".into(),
+                    cylinders: true,
+                    cones: true,
+                    tori: true,
+                    spheres: true,
+                    threads: true,
+                    freeform: true,
+                },
+                vec![SelInput::new("Mesh body", BODIES, false)],
+            ),
             "construct.plane.midplane" => Dialog::new(
                 Kind::Midplane,
                 vec![SelInput::new("First plane", PLANES | PLANAR_FACES, false), SelInput::new("Second plane", PLANES | PLANAR_FACES, false)],
@@ -735,6 +758,7 @@ impl Dialog {
                     .or_else(|| crate::dialogs_appearance::start(app, id))
                     .or_else(|| crate::dialogs_motion::start(app, id))
                     .or_else(|| crate::dialogs_parts::start(app, id))
+                    .or_else(|| crate::dialogs_scad::start(id))
                     .or_else(|| crate::dialogs_part_size::start(app, id))
                     .or_else(|| crate::sketch_text::start(app, id))
                     .or_else(|| crate::sketch_text_move::start(app, id))
@@ -1599,6 +1623,7 @@ fn title(k: &Kind) -> &'static str {
         Kind::Appearance(_) => "APPEARANCE",
         Kind::Motion(k) => k.title(),
         Kind::Part(_) => "INSERT PART",
+        Kind::Scad(_) => "OPENSCAD",
         Kind::PartSize(_) => "Change Part Size",
         Kind::Text(_) => "EDIT TEXT",
         Kind::TextMove(_) => "MOVE/COPY TEXT",
@@ -2843,6 +2868,15 @@ pub(crate) fn feature_frame(s: &Session, component: u64) -> solidcraft_engine::d
     if component == s.active_component { s.active_component_frame() } else { s.placed_document().component_transform(component) }
 }
 
+fn mesh_percent(text: &str) -> Result<f64, String> {
+    let number = text.trim().trim_end_matches('%').trim();
+    let value: f64 = number.parse().map_err(|_| "mesh coverage must be a percentage from 1 to 100".to_string())?;
+    if !(1.0..=100.0).contains(&value) {
+        return Err("mesh coverage must be a percentage from 1 to 100".into());
+    }
+    Ok(value)
+}
+
 /// The feature dialog's current operation name for a reviewed issue draft.
 pub(crate) fn report_title(d: &Dialog) -> String {
     title(&d.kind).to_string()
@@ -3217,13 +3251,17 @@ fn dialog_commands(app: &SolveApp, d: &Dialog) -> Result<Vec<(String, Value)>, S
             let base = plane_arg(app, sels(d, 0).first())?;
             ("construct.plane.offset", json!({"base": base}))
         }
-        Kind::MeshConvert { tolerance } => {
+        Kind::MeshConvert { tolerance, mesh, cylinders, cones, tori, spheres, threads, freeform } => {
             need(0, "the mesh body")?;
             let body = match sels(d, 0).first() {
                 Some(Sel::Body { name }) => name.clone(),
                 _ => return Err("pick the mesh body to convert".into()),
             };
-            ("mesh.convert", json!({"body": body, "tolerance": tolerance}))
+            let mesh = mesh_percent(mesh)?;
+            (
+                "mesh.convert",
+                json!({"body": body, "tolerance": tolerance, "mesh": mesh, "cylinders": cylinders, "cones": cones, "tori": tori, "spheres": spheres, "threads": threads, "freeform": freeform}),
+            )
         }
         Kind::Midplane => {
             need(0, "the first plane")?;
@@ -3579,6 +3617,7 @@ fn dialog_commands(app: &SolveApp, d: &Dialog) -> Result<Vec<(String, Value)>, S
         Kind::Appearance(k) => return Ok(crate::dialogs_appearance::commands(k, &d.inputs)),
         Kind::Motion(k) => return crate::dialogs_motion::commands(app, k, &d.inputs),
         Kind::Part(k) => return crate::dialogs_parts::commands(app, k, &d.inputs),
+        Kind::Scad(k) => return crate::dialogs_scad::commands(k),
         Kind::PartSize(k) => return crate::dialogs_part_size::commands(app, k),
         Kind::Text(k) => return crate::sketch_text::commands(app, k),
         Kind::TextMove(k) => return crate::sketch_text_move::commands(app, k),

@@ -61,6 +61,7 @@ mod kernel_heal_tests;
 mod parameters;
 mod plastic;
 mod render;
+mod scad;
 #[cfg(test)]
 mod script_tests;
 mod sheet;
@@ -297,6 +298,7 @@ pub fn command_specs() -> Vec<&'static CommandSpec> {
     v.extend(materials::COMMANDS.iter());
     v.extend(material_properties::COMMANDS.iter());
     v.extend(libraries::COMMANDS.iter());
+    v.extend(scad::COMMANDS.iter());
     v.extend(section::COMMANDS.iter());
     v.extend(view_navigation::COMMANDS.iter());
     v.extend(view_dxf::COMMANDS.iter());

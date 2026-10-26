@@ -519,6 +519,22 @@ impl<'de> Deserialize<'de> for FlangeEdge {
     }
 }
 
+fn full_mesh_percent() -> f64 {
+    100.0
+}
+
+fn is_full_mesh_percent(value: &f64) -> bool {
+    (*value - 100.0).abs() <= f64::EPSILON
+}
+
+fn recognition_on() -> bool {
+    true
+}
+
+fn is_on(value: &bool) -> bool {
+    *value
+}
+
 /// Feature definitions.
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize, solidcraft_derive::Walk)]
 #[serde(tag = "type", rename_all = "snake_case")]
@@ -1587,11 +1603,27 @@ pub enum FeatureKind {
         #[serde(default, skip_serializing_if = "Vec::is_empty")]
         skip: Vec<u64>,
     },
-    /// Rebuild an upstream constant-section mesh with analytic planar/cylindrical faces.
+    /// Rebuild an upstream mesh with analytic faces. Planes are always fitted. The curved
+    /// families and `mesh` (percent of triangles used as seeds, default 100) are the convert
+    /// dialog's recognition choices. `freeform` keeps leftover triangles as facets.
     MeshConvert {
         body: BodyName,
         #[walk(length = "Tolerance")]
         tolerance: Expr,
+        #[serde(default = "full_mesh_percent", skip_serializing_if = "is_full_mesh_percent")]
+        mesh: f64,
+        #[serde(default = "recognition_on", skip_serializing_if = "is_on")]
+        cylinders: bool,
+        #[serde(default = "recognition_on", skip_serializing_if = "is_on")]
+        cones: bool,
+        #[serde(default = "recognition_on", skip_serializing_if = "is_on")]
+        tori: bool,
+        #[serde(default = "recognition_on", skip_serializing_if = "is_on")]
+        spheres: bool,
+        #[serde(default = "recognition_on", skip_serializing_if = "is_on")]
+        threads: bool,
+        #[serde(default = "recognition_on", skip_serializing_if = "is_on")]
+        freeform: bool,
     },
     /// Mesh bodies imported from a 3MF or STL file, embedded in the design.
     MeshImport {

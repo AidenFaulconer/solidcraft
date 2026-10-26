@@ -5,7 +5,7 @@
 //! one shell without booleans — for solids whose faces are known exactly, such as folded
 //! sheet metal.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 
 use mt::builder;
@@ -856,15 +856,9 @@ fn sew_impl(faces: &[FaceSpec], touching: bool, sources: Option<&[Option<crate::
                     }
                     // Meridian arc through a pole pair, revolved a full turn (same construction
                     // STEP import uses for SPHERICAL_SURFACE).
-                    let axis = f
-                        .probe
-                        .and_then(|(p, _)| (p - *center).normalized())
-                        .unwrap_or(Vec3::Z);
+                    let axis = f.probe.and_then(|(p, _)| (p - *center).normalized()).unwrap_or(Vec3::Z);
                     let x = axis.any_perp();
-                    let (va, vb) = (
-                        builder::vertex(p3(*center - axis * *radius)),
-                        builder::vertex(p3(*center + axis * *radius)),
-                    );
+                    let (va, vb) = (builder::vertex(p3(*center - axis * *radius)), builder::vertex(p3(*center + axis * *radius)));
                     let mid = *center + x * *radius;
                     let swept: mt::Shell = builder::rsweep(&arc_edge(&va, &vb, mid), p3(*center), v3(axis), mt::Rad(std::f64::consts::TAU));
                     let tmp = swept.face_iter().next().cloned().ok_or_else(|| KernelError::Failed("sew: sphere surface".into()))?;
@@ -976,6 +970,35 @@ fn plane_about_the_mean(wires: &[mt::Wire]) -> Option<mt::Plane> {
     }
 }
 
+/// Faces truck rejects with "This wire is not simple." once [`welded`] has run.
+/// A wire that revisits a vertex, or two loops of one face that share one, both get that error.
+pub(crate) fn nonsimple_faces(faces: &[FaceSpec]) -> Vec<usize> {
+    let stored = welded(faces);
+    let faces = stored.as_deref().unwrap_or(faces);
+    faces.iter().enumerate().filter(|(_, face)| !wires_simple(face)).map(|(i, _)| i).collect()
+}
+
+/// Front vertices of each loop are unique, and no vertex is in two loops.
+/// For a closed continuous wire that is what truck's `is_simple` and `disjoint_wires` check.
+fn wires_simple(face: &FaceSpec) -> bool {
+    let mut across = HashSet::new();
+    for lp in &face.loops {
+        let mut seen = HashSet::new();
+        for edge in lp {
+            let (start, _) = edge.ends();
+            if !seen.insert(key(start)) {
+                return false;
+            }
+        }
+        for id in &seen {
+            if !across.insert(*id) {
+                return false;
+            }
+        }
+    }
+    true
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -993,6 +1016,38 @@ mod tests {
         let (a, b, c, d) = (p(0., 0., 0.), p(1., 0., 0.), p(1., 1., 0.), p(0., 1., 0.));
         let (e, f, g, h) = (p(0., 0., 1.), p(1., 0., 1.), p(1., 1., 1.), p(0., 1., 1.));
         vec![quad(a, d, c, b), quad(e, f, g, h), quad(a, b, f, e), quad(b, c, g, f), quad(c, d, h, g), quad(d, a, e, h)]
+    }
+
+    #[test]
+    fn a_wire_that_revisits_a_vertex_is_not_simple() {
+        let p = |x: f64, y: f64| Vec3::new(x, y, 0.0);
+        let (a, b, c, d) = (p(0.0, 0.0), p(2.0, 0.0), p(2.0, 2.0), p(0.0, 2.0));
+        assert!(nonsimple_faces(&[quad(a, b, c, d)]).is_empty());
+        let bow = FaceSpec {
+            loops: vec![vec![
+                EdgeSpec::Line { a, b },
+                EdgeSpec::Line { a: b, b: c },
+                EdgeSpec::Line { a: c, b: d },
+                EdgeSpec::Line { a: d, b },
+                EdgeSpec::Line { a: b, b: a },
+            ]],
+            surface: SurfSpec::Plane,
+            probe: None,
+        };
+        assert_eq!(nonsimple_faces(&[bow]), vec![0]);
+        // 0.6 µm past a cell border still welds onto the first corner, so the loop meets itself.
+        let almost = Vec3::new(0.6e-6, 0.0, 0.0);
+        let welded_loop = FaceSpec {
+            loops: vec![vec![
+                EdgeSpec::Line { a, b },
+                EdgeSpec::Line { a: b, b: c },
+                EdgeSpec::Line { a: c, b: almost },
+                EdgeSpec::Line { a: almost, b: a },
+            ]],
+            surface: SurfSpec::Plane,
+            probe: None,
+        };
+        assert_eq!(nonsimple_faces(&[welded_loop]), vec![0]);
     }
 
     /// A chain's key is the same whichever way it runs. These control points (a joining stroke

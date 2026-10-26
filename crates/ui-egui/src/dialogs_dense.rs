@@ -14,6 +14,7 @@ pub(super) fn command(kind: &Kind) -> Option<&'static str> {
             crate::dialogs_motion::Mo::Configurations { .. } => "config.table",
         }),
         Kind::Part(_) => Some("parts.insert"),
+        Kind::Scad(_) => Some("scad.insert"),
         Kind::PartSize(_) => Some("parts.resize"),
         Kind::SaveMesh(_) => Some("file.save_mesh"),
         Kind::ViewDxf { .. } => Some("file.export_view_dxf"),
@@ -182,6 +183,7 @@ pub(super) fn rows(app: &mut SolveApp, ctx: &egui::Context, d: &mut Dialog, ui: 
         Kind::Appearance(k) => enter |= crate::dialogs_appearance::rows(app, ui, k, &mut d.inputs),
         Kind::Motion(k) => enter |= crate::dialogs_motion::rows(app, ui, k, &mut d.inputs),
         Kind::Part(k) => enter |= crate::dialogs_parts::rows(app, ui, k, &d.inputs),
+        Kind::Scad(k) => enter |= crate::dialogs_scad::rows(app, ui, k),
         Kind::PartSize(k) => enter |= crate::dialogs_part_size::rows(app, ui, k),
         Kind::SaveMesh(k) => enter |= crate::dialogs_save_mesh::rows(app, ui, k),
         Kind::ViewDxf { dashed, tolerance } => crate::dialogs_view_dxf::rows(app, ui, dashed, tolerance),
@@ -644,8 +646,27 @@ fn additional_rows(app: &mut SolveApp, d: &mut Dialog, ui: &mut egui::Ui) -> boo
         Kind::PathPlane { t, .. } => {
             enter |= expr_row(ui, "Position (0 to 1)", t);
         }
-        Kind::MeshConvert { tolerance } => {
+        Kind::MeshConvert { tolerance, mesh, cylinders, cones, tori, spheres, threads, freeform } => {
             form_row(ui, "Tolerance", |ui| enter |= field(ui, tolerance));
+            form_row(ui, "Mesh", |ui| enter |= field(ui, mesh));
+            ui_kit::section(ui, "mesh_recognition", "Recognition", true, |ui| {
+                ui_kit::checkbox_grid(
+                    ui,
+                    &mut [
+                        ("Cylinders", cylinders),
+                        ("Cones", cones),
+                        ("Tori", tori),
+                        ("Spheres", spheres),
+                        ("Threads", threads),
+                        ("Freeform", freeform),
+                    ],
+                    2,
+                );
+                ui.add(
+                    egui::Label::new("Planes are always fitted. Cones, tori and threads stay with those faces until a fitter for them exists. Freeform keeps whatever is left as facets.")
+                        .wrap(),
+                );
+            });
         }
         Kind::Construct { t: Some(t), .. } => {
             form_row(ui, "Position (0 to 1)", |ui| enter |= field(ui, t));
