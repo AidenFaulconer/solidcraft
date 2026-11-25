@@ -8,12 +8,111 @@ use std::f64::consts::{PI, TAU};
 use solidcraft_geom::Vec3;
 
 use crate::meshbody::TriMesh;
-use crate::sew::{EdgeSpec, FaceSpec, SurfSpec, nonsimple_faces, sew};
+use crate::sew::{EdgeSpec, FaceSpec, SurfSpec, drop_degenerate_edges, nonsimple_faces, sew};
 use crate::{Body, KernelError, Result};
 
 const MAX_FACES: usize = 50_000;
 const MAX_LOOP_EDGES: usize = 8_192;
 const MAX_CLUSTER_TRIS: usize = 100_000;
+
+#[cfg(test)]
+mod recognize_stats {
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    static GROWN: AtomicUsize = AtomicUsize::new(0);
+    static PENDING: AtomicUsize = AtomicUsize::new(0);
+    static KEPT: AtomicUsize = AtomicUsize::new(0);
+    static LOOPS: AtomicUsize = AtomicUsize::new(0);
+    static FLAT: AtomicUsize = AtomicUsize::new(0);
+    static CONE_PATCH: AtomicUsize = AtomicUsize::new(0);
+    static CONE_FIT: AtomicUsize = AtomicUsize::new(0);
+    static CONE_PENDING: AtomicUsize = AtomicUsize::new(0);
+    static CONE_KEPT: AtomicUsize = AtomicUsize::new(0);
+    static TRIS: AtomicUsize = AtomicUsize::new(0);
+    static HIST: [AtomicUsize; 6] =
+        [AtomicUsize::new(0), AtomicUsize::new(0), AtomicUsize::new(0), AtomicUsize::new(0), AtomicUsize::new(0), AtomicUsize::new(0)];
+    static DROPPED: AtomicUsize = AtomicUsize::new(0);
+    static EMITTED: AtomicUsize = AtomicUsize::new(0);
+    static OVERLAP: AtomicUsize = AtomicUsize::new(0);
+
+    pub fn reset() {
+        for n in [&GROWN, &PENDING, &KEPT, &LOOPS, &FLAT, &CONE_PATCH, &CONE_FIT, &CONE_PENDING, &CONE_KEPT, &TRIS, &DROPPED, &EMITTED, &OVERLAP] {
+            n.store(0, Ordering::Relaxed);
+        }
+        for n in &HIST {
+            n.store(0, Ordering::Relaxed);
+        }
+    }
+
+    pub fn add(which: &AtomicUsize) {
+        which.fetch_add(1, Ordering::Relaxed);
+    }
+
+    pub fn note_overlap(permille: usize) {
+        OVERLAP.fetch_max(permille, Ordering::Relaxed);
+    }
+
+    pub fn dropped() -> &'static AtomicUsize {
+        &DROPPED
+    }
+    pub fn emitted() -> &'static AtomicUsize {
+        &EMITTED
+    }
+
+    pub fn note_boundary(loops: usize, tris: usize) {
+        let i = loops.min(5);
+        HIST[i].fetch_add(1, Ordering::Relaxed);
+        TRIS.fetch_add(tris, Ordering::Relaxed);
+    }
+
+    pub fn grown() -> &'static AtomicUsize {
+        &GROWN
+    }
+    pub fn pending() -> &'static AtomicUsize {
+        &PENDING
+    }
+    pub fn kept() -> &'static AtomicUsize {
+        &KEPT
+    }
+    pub fn loops() -> &'static AtomicUsize {
+        &LOOPS
+    }
+    pub fn flat() -> &'static AtomicUsize {
+        &FLAT
+    }
+    pub fn cone_patch() -> &'static AtomicUsize {
+        &CONE_PATCH
+    }
+    pub fn cone_fit() -> &'static AtomicUsize {
+        &CONE_FIT
+    }
+    pub fn cone_pending() -> &'static AtomicUsize {
+        &CONE_PENDING
+    }
+    pub fn cone_kept() -> &'static AtomicUsize {
+        &CONE_KEPT
+    }
+
+    pub fn line() -> String {
+        format!(
+            "cyl grown {} pending {} kept {} reject-loops {} reject-flat {} | cone patch {} fit {} pending {} kept {} | loop-hist {:?} avg-tris {:.0} | drop {} emit {} overlap {}/1000",
+            GROWN.load(Ordering::Relaxed),
+            PENDING.load(Ordering::Relaxed),
+            KEPT.load(Ordering::Relaxed),
+            LOOPS.load(Ordering::Relaxed),
+            FLAT.load(Ordering::Relaxed),
+            CONE_PATCH.load(Ordering::Relaxed),
+            CONE_FIT.load(Ordering::Relaxed),
+            CONE_PENDING.load(Ordering::Relaxed),
+            CONE_KEPT.load(Ordering::Relaxed),
+            HIST.each_ref().map(|n| n.load(Ordering::Relaxed)),
+            TRIS.load(Ordering::Relaxed) as f64 / LOOPS.load(Ordering::Relaxed).max(1) as f64,
+            DROPPED.load(Ordering::Relaxed),
+            EMITTED.load(Ordering::Relaxed),
+            OVERLAP.load(Ordering::Relaxed),
+        )
+    }
+}
 
 fn invalid(message: &str) -> KernelError {
     KernelError::Invalid(format!("mesh conversion: {message}"))
@@ -46,6 +145,7 @@ pub fn convert_faceted_mesh(body: &Body, tolerance: f64) -> Result<Body> {
                 &circles,
                 &HashMap::new(),
                 &HashSet::new(),
+                &HashSet::new(),
                 None,
                 &mut HashSet::new(),
             )?);
@@ -53,6 +153,7 @@ pub fn convert_faceted_mesh(body: &Body, tolerance: f64) -> Result<Body> {
                 return Err(invalid("too many faces to convert"));
             }
         }
+        drop_degenerate_edges(&mut faces);
         if faces.len() < 4 {
             return Err(invalid("not enough faces to close a solid"));
         }
@@ -84,7 +185,123 @@ fn seed_kept(seed: usize, fraction: f64) -> bool {
         return true;
     }
     let stride = (1.0 / fraction).round().clamp(1.0, 1000.0) as usize;
-    seed % stride.max(1) == 0
+    seed.is_multiple_of(stride.max(1))
+}
+
+/// A triangle's recognised family, for the convert preview. Tori and threads are not fitted
+/// yet, so their triangles stay a plane, a cylinder, a cone, freeform, or left out.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum FaceGroup {
+    Plane,
+    Cylinder,
+    Cone,
+    Sphere,
+    /// Kept as facets when freeform is on.
+    Freeform,
+    /// Dropped from the solid when freeform is off.
+    LeftOut,
+}
+
+/// Welded triangles and the family each one grew into. This is the segmentation the convert
+/// dialog draws; it does not sew a solid.
+pub struct MeshGroups {
+    pub positions: Vec<Vec3>,
+    pub triangles: Vec<[u32; 3]>,
+    pub groups: Vec<FaceGroup>,
+}
+
+/// Label each triangle of `body` with the family a convert at `options` would grow.
+pub fn label_mesh(body: &Body, options: &crate::mesh_convert::ConvertOptions) -> Result<MeshGroups> {
+    crate::guard("label mesh groups", || {
+        let tolerance = options.tolerance;
+        let angle = options.angle;
+        if !tolerance.is_finite() || !(1e-6..=1.).contains(&tolerance) {
+            return Err(invalid("tolerance must be between 0.000001 and 1 mm"));
+        }
+        if !angle.is_finite() || !(1e-4..=PI / 2.).contains(&angle) {
+            return Err(invalid("angle must be between 0.0001 and π/2 radians"));
+        }
+        let input = body.mesh.as_ref().ok_or_else(|| invalid("select a mesh body"))?;
+        let welded = crate::mesh_convert::weld_mesh(input, tolerance)?;
+        let mesh = welded.mesh.as_ref().ok_or_else(|| invalid("empty mesh"))?;
+        if mesh.triangles.len() > crate::mesh_convert::MAX_CONVERT_TRIANGLES {
+            return Err(invalid("mesh exceeds the conversion triangle budget"));
+        }
+        let (tris, normals, areas) = triangle_geom(mesh)?;
+        let adj = triangle_adjacency(mesh)?;
+        let cos_ang = angle.cos();
+        let fraction = (options.mesh_percent / 100.0).clamp(0.0, 1.0);
+        let recognize = RecognizeOptions {
+            cylinders: options.cylinders,
+            cones: options.cones,
+            tori: options.tori,
+            spheres: options.spheres,
+            threads: options.threads,
+            mesh_fraction: fraction,
+        };
+        let n = mesh.triangles.len();
+        let mut assigned = vec![false; n];
+        let mut groups = vec![if options.freeform { FaceGroup::Freeform } else { FaceGroup::LeftOut }; n];
+        let paint = |groups: &mut [FaceGroup], assigned: &mut [bool], cluster: &[usize], group: FaceGroup| {
+            if cluster.len() < 2 {
+                return;
+            }
+            for &ti in cluster {
+                if let Some(slot) = assigned.get_mut(ti) {
+                    *slot = true;
+                }
+                if let Some(slot) = groups.get_mut(ti) {
+                    *slot = group;
+                }
+            }
+        };
+        for seed in 0..n {
+            if !recognize.cylinders || !seed_kept(seed, recognize.mesh_fraction) || assigned.get(seed).copied().unwrap_or(true) {
+                continue;
+            }
+            if let Some((cluster, _)) = grow_cylinder(mesh, &tris, &normals, &adj, &assigned, seed, tolerance, cos_ang)? {
+                paint(&mut groups, &mut assigned, &cluster, FaceGroup::Cylinder);
+            }
+        }
+        let mut skip_cone = assigned.clone();
+        for seed in 0..n {
+            if !recognize.cones || !seed_kept(seed, recognize.mesh_fraction) || skip_cone.get(seed).copied().unwrap_or(true) {
+                continue;
+            }
+            let (cluster, fit) = grow_cone(mesh, &tris, &normals, &adj, &skip_cone, seed, tolerance)?;
+            if fit.is_some() {
+                paint(&mut groups, &mut assigned, &cluster, FaceGroup::Cone);
+                for &t in &cluster {
+                    if let Some(slot) = skip_cone.get_mut(t) {
+                        *slot = true;
+                    }
+                }
+            } else {
+                for &t in &cluster {
+                    if let Some(slot) = skip_cone.get_mut(t) {
+                        *slot = true;
+                    }
+                }
+            }
+        }
+        for seed in 0..n {
+            if !recognize.spheres || !seed_kept(seed, recognize.mesh_fraction) || assigned.get(seed).copied().unwrap_or(true) {
+                continue;
+            }
+            if let Some((cluster, _)) = grow_sphere(mesh, &tris, &normals, &adj, &assigned, seed, tolerance)? {
+                paint(&mut groups, &mut assigned, &cluster, FaceGroup::Sphere);
+            }
+        }
+        for seed in 0..n {
+            if !seed_kept(seed, recognize.mesh_fraction) || assigned.get(seed).copied().unwrap_or(true) {
+                continue;
+            }
+            if let Some(cluster) = grow_plane(mesh, &tris, &normals, &areas, &adj, &assigned, seed, tolerance, cos_ang)? {
+                paint(&mut groups, &mut assigned, &cluster, FaceGroup::Plane);
+            }
+        }
+        Ok(MeshGroups { positions: mesh.positions.clone(), triangles: mesh.triangles.clone(), groups })
+    })
 }
 
 /// Reconstruct a closed mesh as an analytic solid by clustering coplanar / coaxial /
@@ -116,9 +333,9 @@ pub(crate) fn convert_analytic_with(body: &Body, tolerance: f64, angle: f64, opt
         let (tris, normals, areas) = triangle_geom(mesh)?;
         let adj = triangle_adjacency(mesh)?;
         let cos_ang = angle.cos();
-        // Cones, tori and threads are chosen in the convert dialog. Their triangles stay
-        // eligible for planes until a fitter for those families exists.
-        let _later = (options.cones, options.tori, options.threads);
+        // Tori and threads are chosen in the convert dialog. Their triangles stay eligible
+        // for planes, cylinders and cones until a fitter for those families exists.
+        let _later = (options.tori, options.threads);
         let mut assigned = vec![false; mesh.triangles.len()];
         let mut faces: Vec<FaceSpec> = Vec::new();
         // Triangle cluster behind each planar face, so a pinched wire can be replaced by its triangles.
@@ -153,13 +370,13 @@ pub(crate) fn convert_analytic_with(body: &Body, tolerance: f64, angle: f64, opt
             }
             if let Some((_feature_faces, all_tris)) =
                 try_full_cylinder_feature(mesh, &tris, &normals, &assigned, &cluster, &cyl, tolerance, &mut circles)?
+                && all_tris.len() * 20 >= mesh.triangles.len() * 19
+                && !cylinder_opens_wide(mesh, &cluster, &cyl)
             {
-                if all_tris.len() * 20 >= mesh.triangles.len() * 19 {
-                    let (t_lo, t_hi) = cylinder_height_range(mesh, &cluster, &cyl)?;
-                    let base = cyl.origin + cyl.axis * t_lo;
-                    let height = t_hi - t_lo;
-                    return crate::cylinder(base, cyl.axis, cyl.radius, height).map_err(|e| invalid(&format!("cylinder feature: {e}")));
-                }
+                let (t_lo, t_hi) = cylinder_height_range(mesh, &cluster, &cyl)?;
+                let base = cyl.origin + cyl.axis * t_lo;
+                let height = t_hi - t_lo;
+                return crate::cylinder(base, cyl.axis, cyl.radius, height).map_err(|e| invalid(&format!("cylinder feature: {e}")));
             }
         }
 
@@ -188,6 +405,10 @@ pub(crate) fn convert_analytic_with(body: &Body, tolerance: f64, angle: f64, opt
         // circle, so a tessellated face (tenths of a millimetre off a plane) still sews.
         let mut skip_cyl = assigned.clone();
         let mut pending: Vec<PendingTube> = Vec::new();
+        // Open walls (a channel, a half-round) are not tubes. They are still one cylinder,
+        // and the preview paints them that way. Claimed only after cones, so a frustum
+        // that also fits a short cylinder stays a cone.
+        let mut partial_candidates: Vec<PartialCyl> = Vec::new();
         for seed in 0..mesh.triangles.len() {
             if !options.cylinders || !seed_kept(seed, options.mesh_fraction) || skip_cyl.get(seed).copied().unwrap_or(true) {
                 continue;
@@ -195,10 +416,14 @@ pub(crate) fn convert_analytic_with(body: &Body, tolerance: f64, angle: f64, opt
             let Some((cluster, cyl)) = grow_cylinder(mesh, &tris, &normals, &adj, &skip_cyl, seed, tolerance, cos_ang)? else {
                 continue;
             };
+            #[cfg(test)]
+            recognize_stats::add(recognize_stats::grown());
             if cluster.len() > MAX_CLUSTER_TRIS {
                 return Err(invalid("a cylindrical region exceeds the conversion budget"));
             }
             if let Some(tube) = try_pending_tube(mesh, &cluster, &cyl, tolerance)? {
+                #[cfg(test)]
+                recognize_stats::add(recognize_stats::pending());
                 for &t in &tube.cluster {
                     if let Some(slot) = skip_cyl.get_mut(t) {
                         *slot = true;
@@ -208,6 +433,13 @@ pub(crate) fn convert_analytic_with(body: &Body, tolerance: f64, angle: f64, opt
                     }
                 }
                 pending.push(tube);
+            } else if cylinder_opens_wide(mesh, &cluster, &cyl) {
+                for &t in &cluster {
+                    if let Some(slot) = skip_cyl.get_mut(t) {
+                        *slot = true;
+                    }
+                }
+                partial_candidates.push(PartialCyl { cluster, cyl });
             } else {
                 for &t in &cluster {
                     if let Some(slot) = skip_cyl.get_mut(t) {
@@ -215,6 +447,64 @@ pub(crate) fn convert_analytic_with(body: &Body, tolerance: f64, angle: f64, opt
                     }
                 }
             }
+        }
+
+        // A cone is a ring whose radius changes linearly along one axis (a countersink or a
+        // frustum). Cylinders are already claimed, so a constant radius is not taken here.
+        let mut pending_cones: Vec<PendingCone> = Vec::new();
+        let mut skip_cone = assigned.clone();
+        for seed in 0..mesh.triangles.len() {
+            if !options.cones || !seed_kept(seed, options.mesh_fraction) || skip_cone.get(seed).copied().unwrap_or(true) {
+                continue;
+            }
+            let (cluster, fit) = grow_cone(mesh, &tris, &normals, &adj, &skip_cone, seed, tolerance)?;
+            #[cfg(test)]
+            recognize_stats::add(recognize_stats::cone_patch());
+            let Some(cone) = fit else {
+                for &t in &cluster {
+                    if let Some(slot) = skip_cone.get_mut(t) {
+                        *slot = true;
+                    }
+                }
+                continue;
+            };
+            #[cfg(test)]
+            recognize_stats::add(recognize_stats::cone_fit());
+            if cluster.len() > MAX_CLUSTER_TRIS {
+                return Err(invalid("a conical region exceeds the conversion budget"));
+            }
+            if let Some(pending_cone) = try_pending_cone(mesh, &cluster, &cone, tolerance)? {
+                #[cfg(test)]
+                recognize_stats::add(recognize_stats::cone_pending());
+                for &t in &pending_cone.cluster {
+                    if let Some(slot) = skip_cone.get_mut(t) {
+                        *slot = true;
+                    }
+                    if let Some(slot) = assigned.get_mut(t) {
+                        *slot = true;
+                    }
+                }
+                pending_cones.push(pending_cone);
+            } else {
+                for &t in &cluster {
+                    if let Some(slot) = skip_cone.get_mut(t) {
+                        *slot = true;
+                    }
+                }
+            }
+        }
+
+        let mut partials: Vec<PartialCyl> = Vec::new();
+        for partial in partial_candidates {
+            if partial.cluster.iter().any(|&t| assigned.get(t).copied().unwrap_or(true)) {
+                continue;
+            }
+            for &t in &partial.cluster {
+                if let Some(slot) = assigned.get_mut(t) {
+                    *slot = true;
+                }
+            }
+            partials.push(partial);
         }
 
         let mut planes: Vec<HeldPlane> = Vec::new();
@@ -250,6 +540,8 @@ pub(crate) fn convert_analytic_with(body: &Body, tolerance: f64, angle: f64, opt
             let locked =
                 lock_rim(&mut planes, &owners, &tube.rim0, &tube.cyl, tube.h0) && lock_rim(&mut planes, &owners, &tube.rim1, &tube.cyl, tube.h1);
             if locked {
+                #[cfg(test)]
+                recognize_stats::add(recognize_stats::kept());
                 kept.push(tube);
             } else {
                 for (plane, (n, d, was)) in planes.iter_mut().zip(saved) {
@@ -264,6 +556,28 @@ pub(crate) fn convert_analytic_with(body: &Body, tolerance: f64, angle: f64, opt
                 }
             }
         }
+        let mut kept_cones: Vec<PendingCone> = Vec::new();
+        for cone in pending_cones {
+            let saved: Vec<(Vec3, f64, bool)> = planes.iter().map(|p| (p.n, p.d, p.locked)).collect();
+            let locked = lock_rim(&mut planes, &owners, &cone.rim0, &cone.cyl_at(cone.t0, cone.r0), cone.t0)
+                && lock_rim(&mut planes, &owners, &cone.rim1, &cone.cyl_at(cone.t1, cone.r1), cone.t1);
+            if locked {
+                #[cfg(test)]
+                recognize_stats::add(recognize_stats::cone_kept());
+                kept_cones.push(cone);
+            } else {
+                for (plane, (n, d, was)) in planes.iter_mut().zip(saved) {
+                    plane.n = n;
+                    plane.d = d;
+                    plane.locked = was;
+                }
+                for &t in &cone.cluster {
+                    if let Some(slot) = assigned.get_mut(t) {
+                        *slot = false;
+                    }
+                }
+            }
+        }
         // Tessellation splits one face into patches whose planes are a fraction of a degree
         // apart. Snapping a shared vertex onto both leaves it on neither, and truck then
         // refuses the wire. Fold those patches back into one plane first.
@@ -272,14 +586,57 @@ pub(crate) fn convert_analytic_with(body: &Body, tolerance: f64, angle: f64, opt
         // plane. Emitted on its own, snapping flattens it and the shell no longer closes.
         absorb_coplanar_triangles(mesh, &adj, &mut planes, &mut assigned, tolerance);
         let snapped = snapped_positions(mesh, &planes);
+        let rim_owners = plane_owners(mesh, &planes);
         // Caps look circles up by the rim's vertex set. A geometric fit misses once snapping
         // moves a rim point, and the cap then uses lines the wall does not have.
         let mut by_rim: HashMap<Vec<u32>, Vec<EdgeSpec>> = HashMap::new();
         for tube in &kept {
-            let bot = register_circle(&mut circles, tube.cyl.axis, tube.cyl.origin + tube.cyl.axis * tube.h0, tube.cyl.radius, 0.3)?;
-            let top = register_circle(&mut circles, tube.cyl.axis, tube.cyl.origin + tube.cyl.axis * tube.h1, tube.cyl.radius, 0.3)?;
+            let mut bot = register_circle(&mut circles, tube.cyl.axis, tube.cyl.origin + tube.cyl.axis * tube.h0, tube.cyl.radius, 0.3)?;
+            let mut top = register_circle(&mut circles, tube.cyl.axis, tube.cyl.origin + tube.cyl.axis * tube.h1, tube.cyl.radius, 0.3)?;
+            if let Some((n, d)) = rim_plane(&planes, &rim_owners, &tube.rim0)
+                && circle_near_plane(&bot, n, d)
+            {
+                for edge in &mut bot {
+                    snap_edge_plane(edge, n, d);
+                }
+                circles.insert(circle_key(tube.cyl.axis, tube.cyl.origin + tube.cyl.axis * tube.h0, tube.cyl.radius), bot.clone());
+            }
+            if let Some((n, d)) = rim_plane(&planes, &rim_owners, &tube.rim1)
+                && circle_near_plane(&top, n, d)
+            {
+                for edge in &mut top {
+                    snap_edge_plane(edge, n, d);
+                }
+                circles.insert(circle_key(tube.cyl.axis, tube.cyl.origin + tube.cyl.axis * tube.h1, tube.cyl.radius), top.clone());
+            }
             let mut k0 = tube.rim0.clone();
             let mut k1 = tube.rim1.clone();
+            k0.sort_unstable();
+            k1.sort_unstable();
+            by_rim.insert(k0, bot);
+            by_rim.insert(k1, top);
+        }
+        for cone in &kept_cones {
+            let mut bot = register_circle(&mut circles, cone.axis, cone.apex + cone.axis * cone.t0, cone.r0, 0.3)?;
+            let mut top = register_circle(&mut circles, cone.axis, cone.apex + cone.axis * cone.t1, cone.r1, 0.3)?;
+            if let Some((n, d)) = rim_plane(&planes, &rim_owners, &cone.rim0)
+                && circle_near_plane(&bot, n, d)
+            {
+                for edge in &mut bot {
+                    snap_edge_plane(edge, n, d);
+                }
+                circles.insert(circle_key(cone.axis, cone.apex + cone.axis * cone.t0, cone.r0), bot.clone());
+            }
+            if let Some((n, d)) = rim_plane(&planes, &rim_owners, &cone.rim1)
+                && circle_near_plane(&top, n, d)
+            {
+                for edge in &mut top {
+                    snap_edge_plane(edge, n, d);
+                }
+                circles.insert(circle_key(cone.axis, cone.apex + cone.axis * cone.t1, cone.r1), top.clone());
+            }
+            let mut k0 = cone.rim0.clone();
+            let mut k1 = cone.rim1.clone();
             k0.sort_unstable();
             k1.sort_unstable();
             by_rim.insert(k0, bot);
@@ -288,6 +645,7 @@ pub(crate) fn convert_analytic_with(body: &Body, tolerance: f64, angle: f64, opt
         // A snapped boundary that repeats a vertex is not a face. Those triangles become
         // facets, and neighbouring planes must keep the vertices the facets still use.
         let empty_keep = HashSet::new();
+        let empty_keep_edges = HashSet::new();
         for plane in &planes {
             if matches!(
                 planar_face(
@@ -299,6 +657,7 @@ pub(crate) fn convert_analytic_with(body: &Body, tolerance: f64, angle: f64, opt
                     &circles,
                     &by_rim,
                     &empty_keep,
+                    &empty_keep_edges,
                     Some(PlaneFit { n: plane.n, d: plane.d }),
                     &mut HashSet::new(),
                 ),
@@ -312,11 +671,16 @@ pub(crate) fn convert_analytic_with(body: &Body, tolerance: f64, angle: f64, opt
             }
         }
         let mut leftover_verts = HashSet::new();
+        let mut leftover_edges = HashSet::new();
         for (ti, tri) in mesh.triangles.iter().enumerate() {
             if assigned.get(ti).copied().unwrap_or(true) {
                 continue;
             }
             leftover_verts.extend(tri.iter().copied());
+            let [a, b, c] = *tri;
+            for (u, v) in [(a, b), (b, c), (c, a)] {
+                leftover_edges.insert((u.min(v), u.max(v)));
+            }
         }
         let mut used_rims: HashSet<Vec<u32>> = HashSet::new();
         for pass in 0..2 {
@@ -336,6 +700,7 @@ pub(crate) fn convert_analytic_with(body: &Body, tolerance: f64, angle: f64, opt
                     &circles,
                     &by_rim,
                     &leftover_verts,
+                    &leftover_edges,
                     Some(PlaneFit { n: plane.n, d: plane.d }),
                     &mut used_rims,
                 ) {
@@ -350,6 +715,18 @@ pub(crate) fn convert_analytic_with(body: &Body, tolerance: f64, angle: f64, opt
             for tube in &kept {
                 let mut k0 = tube.rim0.clone();
                 let mut k1 = tube.rim1.clone();
+                k0.sort_unstable();
+                k1.sort_unstable();
+                let (hit0, hit1) = (used_rims.contains(&k0), used_rims.contains(&k1));
+                if hit0 != hit1 {
+                    orphan = true;
+                    by_rim.remove(&k0);
+                    by_rim.remove(&k1);
+                }
+            }
+            for cone in &kept_cones {
+                let mut k0 = cone.rim0.clone();
+                let mut k1 = cone.rim1.clone();
                 k0.sort_unstable();
                 k1.sort_unstable();
                 let (hit0, hit1) = (used_rims.contains(&k0), used_rims.contains(&k1));
@@ -377,6 +754,8 @@ pub(crate) fn convert_analytic_with(body: &Body, tolerance: f64, angle: f64, opt
                 k0.sort_unstable();
                 k1.sort_unstable();
                 if !used_rims.contains(&k0) || !used_rims.contains(&k1) {
+                    #[cfg(test)]
+                    recognize_stats::add(recognize_stats::dropped());
                     for &t in &tube.cluster {
                         if let Some(slot) = assigned.get_mut(t) {
                             *slot = false;
@@ -385,6 +764,23 @@ pub(crate) fn convert_analytic_with(body: &Body, tolerance: f64, angle: f64, opt
                     continue;
                 }
                 curved.extend(cylinder_face(mesh, &tube.cluster, &tube.cyl, tolerance, &mut circles)?);
+                #[cfg(test)]
+                recognize_stats::add(recognize_stats::emitted());
+            }
+            for cone in &kept_cones {
+                let mut k0 = cone.rim0.clone();
+                let mut k1 = cone.rim1.clone();
+                k0.sort_unstable();
+                k1.sort_unstable();
+                if !used_rims.contains(&k0) || !used_rims.contains(&k1) {
+                    for &t in &cone.cluster {
+                        if let Some(slot) = assigned.get_mut(t) {
+                            *slot = false;
+                        }
+                    }
+                    continue;
+                }
+                curved.extend(cone_face(mesh, cone, &mut circles)?);
             }
             for (face, cluster) in staged {
                 push_face(&mut faces, &mut origins, face, cluster)?;
@@ -392,12 +788,41 @@ pub(crate) fn convert_analytic_with(body: &Body, tolerance: f64, angle: f64, opt
             break;
         }
 
+        // An open cylinder keeps every mesh edge of its boundary, so the planes and
+        // leftover triangles beside it use the same lines. A patch that will not make a
+        // simple wire is released and filled as triangles with the rest.
+        let mut partial_faces: Vec<(FaceSpec, Vec<usize>)> = Vec::new();
+        for partial in partials {
+            match partial_cylinder_face(mesh, &snapped, &partial.cluster, &partial.cyl) {
+                Ok(face) => partial_faces.push((face, partial.cluster)),
+                Err(_) => {
+                    for &t in &partial.cluster {
+                        if let Some(slot) = assigned.get_mut(t) {
+                            *slot = false;
+                        }
+                    }
+                }
+            }
+        }
+
         // Leftover triangles as planar facets so the shell can still close.
         for seed in 0..mesh.triangles.len() {
             if assigned.get(seed).copied().unwrap_or(true) {
                 continue;
             }
-            let face = planar_face(mesh, &snapped, &[seed], &normals, tolerance, &circles, &by_rim, &HashSet::new(), None, &mut HashSet::new())?;
+            let face = planar_face(
+                mesh,
+                &snapped,
+                &[seed],
+                &normals,
+                tolerance,
+                &circles,
+                &by_rim,
+                &HashSet::new(),
+                &HashSet::new(),
+                None,
+                &mut HashSet::new(),
+            )?;
             if let Some(slot) = assigned.get_mut(seed) {
                 *slot = true;
             }
@@ -434,13 +859,22 @@ pub(crate) fn convert_analytic_with(body: &Body, tolerance: f64, angle: f64, opt
                 {
                     pinched_faces += 1;
                 }
-                let mut at = fi;
-                for ti in cluster {
-                    let face =
-                        planar_face(mesh, &snapped, &[ti], &normals, tolerance, &circles, &by_rim, &HashSet::new(), None, &mut HashSet::new())?;
+                for (at, ti) in (fi..).zip(cluster) {
+                    let face = planar_face(
+                        mesh,
+                        &snapped,
+                        &[ti],
+                        &normals,
+                        tolerance,
+                        &circles,
+                        &by_rim,
+                        &HashSet::new(),
+                        &HashSet::new(),
+                        None,
+                        &mut HashSet::new(),
+                    )?;
                     faces.insert(at, face);
                     origins.insert(at, vec![ti]);
-                    at += 1;
                     if faces.len() > MAX_FACES {
                         return Err(invalid("too many faces to convert"));
                     }
@@ -451,19 +885,129 @@ pub(crate) fn convert_analytic_with(body: &Body, tolerance: f64, angle: f64, opt
         // A triangle snapped almost flat has no normal truck will accept, but its edges are
         // already shared. Fold it into the neighbour across the long edge so the shell still closes.
         fold_sliver_triangles(&mut faces, &mut origins);
+        // Adjacent facets of one flat become one face. The reference converter does the same
+        // merge before it writes a solid; leaving them split is what makes Confirm look like the STL.
+        merge_adjacent_coplanar(&mut faces, &mut origins, tolerance, cos_ang);
 
-        // Try sewing with curved faces; if the shell will not close, demote curved
-        // clusters to per-triangle planar facets and sew a faceted solid instead.
+        // Try sewing with curved faces. An open cylinder that will not close is replaced
+        // by its triangles, which share the mesh edges, and the planes are sewn again.
+        // Giving up here drops every grouped face and the import looks like the STL.
         let mut attempt = faces.clone();
         attempt.extend(curved.iter().cloned());
         // Snapping onto two planes leaves one shared corner a few hundredths of a micrometre
         // apart. That is enough for the edge not to be shared, so the shell stays open.
+        // Open-cylinder wires are appended afterwards: pulling one of their points onto a
+        // plane corner lifts that plane off itself, and truck then refuses the wire.
         unify_near_corners(&mut attempt, 3e-5);
+        // Unifying corners closer than the sew weld turns a short edge into a
+        // zero-length one, which sew refuses. Drop those edges before sewing.
+        drop_degenerate_edges(&mut attempt);
+        // A patch that was flat enough to grow can collapse once corners weld. Fold it into
+        // the neighbour so the shell stays closed and the cylinders are not thrown away.
+        fold_flat_faces(&mut attempt);
+        drop_degenerate_edges(&mut attempt);
+        // Truck rejects a plane whose corners are a few hundredths of a millimetre off, which is
+        // still inside the convert tolerance. Lay each corner on the planes that meet there.
+        flatten_plane_corners(&mut attempt, tolerance);
+        drop_degenerate_edges(&mut attempt);
+        let mut partial_only: Vec<FaceSpec> = partial_faces.iter().map(|(face, _)| face.clone()).collect();
+        // Cylinder rims use the mesh corners. Follow the plane corner each one was fitted to,
+        // and leave an edge alone when both ends would collapse onto the same point.
+        snap_partial_corners(&mut partial_only, &attempt, tolerance);
+        attempt.extend(partial_only);
+        drop_degenerate_edges(&mut attempt);
+        #[cfg(test)]
+        if !partial_faces.is_empty() {
+            eprintln!("diag open-cyl built={}", partial_faces.len());
+        }
         if attempt.len() < 4 {
             return Err(invalid("not enough faces to close a solid"));
         }
         match sew(&attempt) {
             Ok(body) => Ok(body),
+            Err(first) if !partial_faces.is_empty() => {
+                #[cfg(test)]
+                {
+                    eprintln!(
+                        "diag open-cyl sew failed faces={} curved={} partials={} attempt={}: {first}",
+                        faces.len(),
+                        curved.len(),
+                        partial_faces.len(),
+                        attempt.len()
+                    );
+                    if let Some(fi) = first
+                        .to_string()
+                        .split("face ")
+                        .nth(1)
+                        .and_then(|rest| rest.split(|c: char| !c.is_ascii_digit()).next())
+                        .and_then(|n| n.parse::<usize>().ok())
+                        && let Some(face) = attempt.get(fi)
+                    {
+                        let edges = face.loops.iter().map(|lp| lp.len()).sum::<usize>();
+                        let (nlen, dev) = face_plane_metrics(face);
+                        eprintln!(
+                            "diag bad face {fi} edges={edges} loops={} dev={dev:.3e} nlen={nlen:.3e} revolved={}",
+                            face.loops.len(),
+                            matches!(face.surface, SurfSpec::Revolved { .. })
+                        );
+                    }
+                }
+                // Slivers flattened by the corner weld have no area, and one of them makes
+                // truck refuse the whole shell. Drop every empty plane and sew again, cylinders
+                // included. If the shell is then open, the triangles below take over.
+                let trimmed: Vec<FaceSpec> = attempt
+                    .iter()
+                    .filter(|face| match face.surface {
+                        SurfSpec::Revolved { .. } | SurfSpec::Sphere { .. } => true,
+                        _ => {
+                            let (nlen, _) = face_plane_metrics(face);
+                            nlen >= 1e-6
+                        }
+                    })
+                    .cloned()
+                    .collect();
+                if trimmed.len() >= 4
+                    && trimmed.len() < attempt.len()
+                    && let Ok(body) = sew(&trimmed)
+                {
+                    return Ok(body);
+                }
+                for (_, cluster) in &partial_faces {
+                    for &ti in cluster {
+                        let face = planar_face(
+                            mesh,
+                            &snapped,
+                            &[ti],
+                            &normals,
+                            tolerance,
+                            &circles,
+                            &by_rim,
+                            &HashSet::new(),
+                            &HashSet::new(),
+                            None,
+                            &mut HashSet::new(),
+                        )?;
+                        push_face(&mut faces, &mut origins, face, vec![ti])?;
+                    }
+                }
+                merge_adjacent_coplanar(&mut faces, &mut origins, tolerance, cos_ang);
+                let mut retry = faces.clone();
+                retry.extend(curved.iter().cloned());
+                unify_near_corners(&mut retry, 3e-5);
+                drop_degenerate_edges(&mut retry);
+                fold_flat_faces(&mut retry);
+                drop_degenerate_edges(&mut retry);
+                if retry.len() >= 4
+                    && let Ok(body) = sew(&retry)
+                {
+                    return Ok(body);
+                }
+                if curved.is_empty() {
+                    Err(invalid(&format!("sew failed (planar-only): {first}")))
+                } else {
+                    Err(invalid(&format!("curved faces would not sew: {first}")))
+                }
+            }
             Err(e) if curved.is_empty() => {
                 #[cfg(test)]
                 {
@@ -687,6 +1231,307 @@ struct CylFit {
     radius: f64,
 }
 
+#[derive(Clone, Copy)]
+struct ConeFit {
+    axis: Vec3,
+    apex: Vec3,
+    /// How fast the radius grows along `axis`, in millimetres per millimetre. Positive.
+    slope: f64,
+}
+
+/// Smooth patch around `seed` (stops at a crease), then a cone fit when the radius
+/// changes linearly along the normals' axis. The returned cluster is the patch either way,
+/// so a patch that is not a cone is not grown again.
+fn grow_cone(
+    _mesh: &TriMesh,
+    tris: &[[Vec3; 3]],
+    normals: &[Vec3],
+    adj: &[Vec<usize>],
+    assigned: &[bool],
+    seed: usize,
+    tolerance: f64,
+) -> Result<(Vec<usize>, Option<ConeFit>)> {
+    let Some(n0) = normals.get(seed).copied() else {
+        return Ok((Vec::new(), None));
+    };
+    let mut cluster = vec![seed];
+    let mut in_cluster = HashSet::from([seed]);
+    let mut fit: Option<ConeFit> = None;
+    let mut stack = vec![seed];
+    let mut steps = 0usize;
+    while let Some(ti) = stack.pop() {
+        steps += 1;
+        if steps > MAX_CLUSTER_TRIS {
+            return Err(invalid("a conical region exceeds the conversion budget"));
+        }
+        let Some(n_here) = normals.get(ti).copied() else { continue };
+        for &nb in adj.get(ti).into_iter().flatten() {
+            if assigned.get(nb).copied().unwrap_or(true) || in_cluster.contains(&nb) {
+                continue;
+            }
+            if cluster.len() > MAX_CLUSTER_TRIS {
+                return Err(invalid("a conical region exceeds the conversion budget"));
+            }
+            let Some(nn) = normals.get(nb).copied() else { continue };
+            // A right-angle edge is a cap or a side wall, not more of this cone.
+            if nn.dot(n_here) < 0.70 {
+                continue;
+            }
+            let take = if let Some(cone) = fit {
+                triangle_on_cone(tris, normals, nb, &cone, tolerance)
+            } else if nn.dot(n0) > 0.97 || (cluster.len() < 48 && nn.dot(n_here) > 0.90) {
+                // Same facet, then the next facet, until the patch is large enough to fit.
+                true
+            } else {
+                false
+            };
+            if !take {
+                continue;
+            }
+            in_cluster.insert(nb);
+            cluster.push(nb);
+            stack.push(nb);
+            if cluster.len() >= 8 && (fit.is_none() || cluster.len().is_multiple_of(16)) {
+                fit = fit_cone(tris, normals, &cluster, tolerance).or(fit);
+            }
+        }
+    }
+    if cluster.len() < 8 {
+        return Ok((cluster, None));
+    }
+    let Some(cone) = fit.or_else(|| fit_cone(tris, normals, &cluster, tolerance)) else {
+        return Ok((cluster, None));
+    };
+    // The early triangles were admitted before the fit existed. Keep only those on the cone,
+    // then pick up any neighbour the first pass stopped short of.
+    cluster.retain(|&t| t == seed || triangle_on_cone(tris, normals, t, &cone, tolerance));
+    in_cluster.clear();
+    in_cluster.extend(cluster.iter().copied());
+    if !in_cluster.contains(&seed) {
+        cluster.push(seed);
+        in_cluster.insert(seed);
+    }
+    let mut extra = cluster.clone();
+    let mut guard = 0usize;
+    while let Some(ti) = extra.pop() {
+        guard += 1;
+        if guard > MAX_CLUSTER_TRIS {
+            break;
+        }
+        for &nb in adj.get(ti).into_iter().flatten() {
+            if assigned.get(nb).copied().unwrap_or(true) || !in_cluster.insert(nb) {
+                continue;
+            }
+            if triangle_on_cone(tris, normals, nb, &cone, tolerance) {
+                cluster.push(nb);
+                extra.push(nb);
+            } else {
+                in_cluster.remove(&nb);
+            }
+        }
+    }
+    if cluster.len() < 8 {
+        return Ok((cluster, None));
+    }
+    let cone = fit_cone(tris, normals, &cluster, tolerance).unwrap_or(cone);
+    Ok((cluster, Some(cone)))
+}
+
+fn triangle_on_cone(tris: &[[Vec3; 3]], normals: &[Vec3], ti: usize, cone: &ConeFit, tolerance: f64) -> bool {
+    let (Some(tri), Some(nn)) = (tris.get(ti), normals.get(ti).copied()) else { return false };
+    let cos = cone.slope / (1.0 + cone.slope * cone.slope).sqrt();
+    if (nn.dot(cone.axis).abs() - cos).abs() > 0.15 {
+        return false;
+    }
+    tri.iter().all(|p| {
+        let d = *p - cone.apex;
+        let t = d.dot(cone.axis);
+        let r = (d - cone.axis * t).len();
+        t > tolerance && (r - cone.slope * t).abs() <= tolerance * 4.
+    })
+}
+
+fn fit_cone(tris: &[[Vec3; 3]], normals: &[Vec3], cluster: &[usize], tolerance: f64) -> Option<ConeFit> {
+    let mut pts = Vec::new();
+    let mut nrms = Vec::new();
+    for &t in cluster {
+        let Some(tri) = tris.get(t) else { continue };
+        let Some(nn) = normals.get(t).copied() else { continue };
+        pts.push((tri[0] + tri[1] + tri[2]) * (1. / 3.));
+        nrms.push(nn);
+    }
+    if pts.len() < 8 {
+        return None;
+    }
+    let axis = axis_of_normals(&nrms)?;
+    let cos = nrms.iter().map(|n| n.dot(axis)).sum::<f64>() / nrms.len() as f64;
+    // A cylinder's normals are perpendicular to its axis, a plane's are parallel to it.
+    if cos.abs() < 0.08 || cos.abs() > 0.92 {
+        return None;
+    }
+    if nrms.iter().any(|n| (n.dot(axis) - cos).abs() > 0.15) {
+        return None;
+    }
+    let apex = fit_apex(&pts, &nrms)?;
+    let mut ts = Vec::with_capacity(pts.len());
+    let mut rs = Vec::with_capacity(pts.len());
+    for p in &pts {
+        let d = *p - apex;
+        let t = d.dot(axis);
+        let r = (d - axis * t).len();
+        if !t.is_finite() || !r.is_finite() || t.abs() < tolerance {
+            return None;
+        }
+        ts.push(t);
+        rs.push(r);
+    }
+    let (slope, intercept, r2) = linear_fit(&ts, &rs)?;
+    if slope.abs() < 0.06 || r2 < 0.82 {
+        return None;
+    }
+    let r_span = rs.iter().copied().fold(0.0_f64, f64::max) - rs.iter().copied().fold(f64::INFINITY, f64::min);
+    let r_typ = rs.iter().copied().fold(0.0_f64, f64::max);
+    if intercept.abs() > tolerance.max(r_span * 0.15) {
+        return None;
+    }
+    // A faceted cone's normal misses the apex by a fraction of the radius. A sphere's
+    // tangent planes do not share an apex, so this still rejects one.
+    if pts.iter().zip(&nrms).any(|(p, n)| (*p - apex).dot(*n).abs() > tolerance.max(r_typ * 0.12)) {
+        return None;
+    }
+    let axis = if slope < 0. { -axis } else { axis };
+    let slope = slope.abs();
+    let mut t_min = f64::INFINITY;
+    for p in &pts {
+        let t = (*p - apex).dot(axis);
+        let r = (*p - apex - axis * t).len();
+        if t <= tolerance || (slope * t - r).abs() > tolerance * 4. {
+            return None;
+        }
+        t_min = t_min.min(t);
+    }
+    if !t_min.is_finite() {
+        return None;
+    }
+    Some(ConeFit { axis, apex, slope })
+}
+
+fn axis_of_normals(nrms: &[Vec3]) -> Option<Vec3> {
+    let mean = nrms.iter().copied().fold(Vec3::ZERO, |a, n| a + n) / nrms.len() as f64;
+    let mut c = [[0.0_f64; 3]; 3];
+    for n in nrms {
+        let d = *n - mean;
+        let v = [d.x, d.y, d.z];
+        for i in 0..3 {
+            for j in 0..3 {
+                c[i][j] += v[i] * v[j];
+            }
+        }
+    }
+    let mut x = Vec3::new(0.17, 0.31, 0.93).normalized()?;
+    let mut solved = false;
+    for _ in 0..32 {
+        let Some(v) = solve3(c, [x.x, x.y, x.z]) else { break };
+        let next = Vec3::new(v[0], v[1], v[2]);
+        if next.len() < 1e-14 {
+            break;
+        }
+        x = next.normalized()?;
+        solved = true;
+    }
+    if !solved {
+        x = null_direction(&c)?;
+    }
+    let spread = nrms.iter().map(|n| (n.dot(x) - nrms[0].dot(x)).abs()).fold(0.0_f64, f64::max);
+    (spread < 0.2).then_some(x)
+}
+
+/// Direction the covariance does not span, when the normals lie in one plane.
+fn null_direction(c: &[[f64; 3]; 3]) -> Option<Vec3> {
+    let rows = [Vec3::new(c[0][0], c[0][1], c[0][2]), Vec3::new(c[1][0], c[1][1], c[1][2]), Vec3::new(c[2][0], c[2][1], c[2][2])];
+    let mut best = Vec3::ZERO;
+    for i in 0..3 {
+        let n = rows[i].cross(rows[(i + 1) % 3]);
+        if n.len() > best.len() {
+            best = n;
+        }
+    }
+    best.normalized()
+}
+
+fn fit_apex(pts: &[Vec3], nrms: &[Vec3]) -> Option<Vec3> {
+    let mut m = [[0.0_f64; 3]; 3];
+    let mut rhs = [0.0_f64; 3];
+    for (p, n) in pts.iter().zip(nrms) {
+        let nv = [n.x, n.y, n.z];
+        let k = n.dot(*p);
+        for i in 0..3 {
+            for j in 0..3 {
+                m[i][j] += nv[i] * nv[j];
+            }
+            rhs[i] += nv[i] * k;
+        }
+    }
+    let v = solve3(m, rhs)?;
+    let apex = Vec3::new(v[0], v[1], v[2]);
+    (apex.x.is_finite() && apex.y.is_finite() && apex.z.is_finite() && apex.len() < 1e7).then_some(apex)
+}
+
+fn linear_fit(xs: &[f64], ys: &[f64]) -> Option<(f64, f64, f64)> {
+    let n = xs.len() as f64;
+    if xs.len() < 4 || xs.len() != ys.len() {
+        return None;
+    }
+    let (mut sx, mut sy, mut sxx, mut sxy, mut syy) = (0.0, 0.0, 0.0, 0.0, 0.0);
+    for (x, y) in xs.iter().zip(ys) {
+        sx += x;
+        sy += y;
+        sxx += x * x;
+        sxy += x * y;
+        syy += y * y;
+    }
+    let den = n * sxx - sx * sx;
+    if den.abs() < 1e-12 {
+        return None;
+    }
+    let slope = (n * sxy - sx * sy) / den;
+    let intercept = (sy - slope * sx) / n;
+    let ss_tot = syy - sy * sy / n;
+    let ss_res = xs
+        .iter()
+        .zip(ys)
+        .map(|(x, y)| {
+            let e = y - (intercept + slope * x);
+            e * e
+        })
+        .sum::<f64>();
+    let r2 = if ss_tot.abs() < 1e-12 { 1.0 } else { 1.0 - ss_res / ss_tot };
+    (slope.is_finite() && intercept.is_finite() && r2.is_finite()).then_some((slope, intercept, r2))
+}
+
+fn solve3(m: [[f64; 3]; 3], r: [f64; 3]) -> Option<[f64; 3]> {
+    let det = |a: [[f64; 3]; 3]| {
+        a[0][0] * (a[1][1] * a[2][2] - a[1][2] * a[2][1]) - a[0][1] * (a[1][0] * a[2][2] - a[1][2] * a[2][0])
+            + a[0][2] * (a[1][0] * a[2][1] - a[1][1] * a[2][0])
+    };
+    let d = det(m);
+    if d.abs() < 1e-12 {
+        return None;
+    }
+    let mut out = [0.0; 3];
+    for (k, o) in out.iter_mut().enumerate() {
+        let mut mk = m;
+        for (row, rv) in mk.iter_mut().zip(r) {
+            row[k] = rv;
+        }
+        *o = det(mk) / d;
+        if !o.is_finite() {
+            return None;
+        }
+    }
+    Some(out)
+}
+
 /// True when `seed` and `other` are facets of one cylinder about `n0 × n1`.
 /// Rejects a neighbour that only happens to sit in the normal fan-out band.
 fn wall_pair_shares_cylinder(tris: &[[Vec3; 3]], seed: usize, other: usize, n0: Vec3, n1: Vec3, tolerance: f64) -> bool {
@@ -717,7 +1562,8 @@ fn triangle_on_cylinder(tris: &[[Vec3; 3]], normals: &[Vec3], ti: usize, cyl: &C
     let on_radius = tri.iter().all(|p| {
         let w = *p - cyl.origin;
         let radial = w - cyl.axis * w.dot(cyl.axis);
-        (radial.len() - cyl.radius).abs() <= tolerance * 2.
+        // Wider than the final fit so a short-arc seed can still reach the rest of the hole.
+        (radial.len() - cyl.radius).abs() <= (tolerance * 6.).max(0.12)
     });
     if !on_radius {
         return false;
@@ -791,7 +1637,10 @@ fn grow_cylinder(
     let mut far_dot = 1.0_f64;
     let mut seen = HashSet::from([seed]);
     let mut frontier = vec![seed];
-    for _depth in 0..16 {
+    // Keep walking until the wall has turned about 60°. Stopping at the first 23°
+    // of fan-out fits a circle to a short arc, and that radius is too unstable to
+    // claim the rest of a fine hole.
+    for _depth in 0..48 {
         let mut next = Vec::new();
         for &ti in &frontier {
             for &nb in adj.get(ti).into_iter().flatten() {
@@ -806,20 +1655,28 @@ fn grow_cylinder(
                 if d < MIN_WALL_DOT {
                     continue;
                 }
-                if hood_pts.len() < 96
+                // A countersink meets the wall at a shallow crease. Its points are not on
+                // the cylinder; taking them into the fit used to reject the hole. Same-facet
+                // triangles (a few degrees apart) are how a fine wall is reached.
+                let shares = wall_pair_shares_cylinder(tris, seed, nb, n0, nn, tolerance);
+                let same_facet = d > 0.97;
+                if !shares && !same_facet {
+                    continue;
+                }
+                if shares
+                    && hood_pts.len() < 480
                     && let Some(tri) = tris.get(nb)
                 {
                     hood_pts.extend_from_slice(tri);
                 }
-                // Prefer the most rotated neighbour that still shares this cylinder.
-                if d <= MAX_WALL_DOT && d < far_dot && wall_pair_shares_cylinder(tris, seed, nb, n0, nn, tolerance) {
+                if shares && d <= MAX_WALL_DOT && d < far_dot {
                     far_dot = d;
                     far = nn;
                 }
                 next.push(nb);
             }
         }
-        if far_dot <= MAX_WALL_DOT {
+        if far_dot <= 0.50 {
             break;
         }
         if next.is_empty() {
@@ -883,7 +1740,7 @@ fn grow_cylinder(
 }
 
 fn fit_cylinder_pts(pts: &[Vec3], nrms: &[Vec3], axis_hint: Vec3, tolerance: f64) -> Option<CylFit> {
-    let Some(&n0) = nrms.first() else { return None };
+    let &n0 = nrms.first()?;
     // Wall–wall fan-out only (same band as grow_cylinder). Cap normals would yield a
     // circumferential “axis” and a nonsense radius.
     const MAX_WALL_DOT: f64 = 0.92;
@@ -1004,7 +1861,7 @@ fn grow_sphere(
     let mut seen = HashSet::from([seed]);
     let mut frontier = vec![seed];
     let mut seed_tris = vec![seed];
-    let mut pts: Vec<Vec3> = seed_tri.iter().copied().collect();
+    let mut pts: Vec<Vec3> = seed_tri.to_vec();
     for _depth in 0..24 {
         let mut next = Vec::new();
         for &ti in &frontier {
@@ -1244,6 +2101,355 @@ fn is_sliver_triangle(face: &FaceSpec) -> bool {
     (pts[1] - pts[0]).cross(pts[2] - pts[0]).len() < 1.5e-6
 }
 
+fn is_flat_sliver(face: &FaceSpec) -> bool {
+    if !matches!(face.surface, SurfSpec::Plane) || face.loops.len() != 1 {
+        return false;
+    }
+    let Some(lp) = face.loops.first() else { return false };
+    if lp.len() < 3 || lp.iter().any(|edge| line_ends(edge).is_none()) {
+        return false;
+    }
+    let (nlen, dev) = face_plane_metrics(face);
+    nlen < 1e-6 && dev <= 1e-7
+}
+
+/// A welded patch with no area still occupies edges. Splice it into the neighbour across
+/// its longest shared edge so those edges stay in the shell.
+fn fold_flat_faces(faces: &mut Vec<FaceSpec>) {
+    let mut skip = 0usize;
+    for _ in 0..128 {
+        let Some(rel) = faces.iter().skip(skip).position(is_flat_sliver) else { break };
+        let si = skip + rel;
+        if fold_face_into_neighbor(faces, si) {
+            skip = 0;
+        } else {
+            skip = si + 1;
+        }
+    }
+}
+
+fn fold_face_into_neighbor(faces: &mut Vec<FaceSpec>, si: usize) -> bool {
+    let Some(edges) = faces.get(si).and_then(|face| face.loops.first()).cloned() else { return false };
+    if edges.len() < 3 {
+        return false;
+    }
+    let mut order: Vec<usize> = (0..edges.len()).collect();
+    order.sort_by(|&i, &j| {
+        let li = line_ends(&edges[i]).map(|(a, b)| a.dist(b)).unwrap_or(0.0);
+        let lj = line_ends(&edges[j]).map(|(a, b)| a.dist(b)).unwrap_or(0.0);
+        lj.partial_cmp(&li).unwrap_or(std::cmp::Ordering::Equal)
+    });
+    for long in order {
+        let Some((a, b)) = line_ends(&edges[long]) else { continue };
+        let (ka, kb) = (quant_pt(a), quant_pt(b));
+        let mut host: Option<(usize, usize, usize, bool)> = None;
+        for (fi, face) in faces.iter().enumerate() {
+            if fi == si || !matches!(face.surface, SurfSpec::Plane) {
+                continue;
+            }
+            for (li, lp) in face.loops.iter().enumerate() {
+                for (ei, edge) in lp.iter().enumerate() {
+                    let Some((c, d)) = line_ends(edge) else { continue };
+                    let (kc, kd) = (quant_pt(c), quant_pt(d));
+                    if kc == kb && kd == ka {
+                        host = Some((fi, li, ei, false));
+                    } else if kc == ka && kd == kb {
+                        host = Some((fi, li, ei, true));
+                    }
+                }
+            }
+        }
+        let Some((fi, li, ei, same_dir)) = host else { continue };
+        let n = edges.len();
+        let mut bridge: Vec<EdgeSpec> = (1..n).map(|k| edges[(long + k) % n].clone()).collect();
+        if same_dir {
+            reverse_loop(&mut bridge);
+        }
+        let Some(lp) = faces.get(fi).and_then(|face| face.loops.get(li)) else { continue };
+        if ei >= lp.len() || lp.len() + bridge.len() > MAX_LOOP_EDGES {
+            continue;
+        }
+        let mut merged = lp.clone();
+        merged.splice(ei..=ei, bridge);
+        if !loop_is_simple(&merged) {
+            continue;
+        }
+        if let Some(lp) = faces.get_mut(fi).and_then(|face| face.loops.get_mut(li)) {
+            *lp = merged;
+        }
+        faces.remove(si);
+        return true;
+    }
+    false
+}
+
+/// Join two planar faces that share one edge when both still lie on one plane.
+/// One pass pairs disjoint edges, so a flat of many facets collapses in a few passes.
+fn merge_adjacent_coplanar(faces: &mut Vec<FaceSpec>, origins: &mut Vec<Vec<usize>>, tol: f64, cos_ang: f64) {
+    for _ in 0..24 {
+        let mut located: HashMap<(i64, i64, i64, i64, i64, i64), Vec<(usize, usize, bool)>> = HashMap::new();
+        for (fi, face) in faces.iter().enumerate() {
+            if !matches!(face.surface, SurfSpec::Plane) || face.loops.len() != 1 {
+                continue;
+            }
+            let Some(lp) = face.loops.first() else { continue };
+            if lp.iter().any(|edge| line_ends(edge).is_none()) {
+                continue;
+            }
+            for (ei, edge) in lp.iter().enumerate() {
+                let Some((a, b)) = line_ends(edge) else { continue };
+                let (ka, kb) = (quant_pt(a), quant_pt(b));
+                let (key, flipped) = if (kb.0, kb.1, kb.2) < (ka.0, ka.1, ka.2) {
+                    ((kb.0, kb.1, kb.2, ka.0, ka.1, ka.2), true)
+                } else {
+                    ((ka.0, ka.1, ka.2, kb.0, kb.1, kb.2), false)
+                };
+                located.entry(key).or_default().push((fi, ei, flipped));
+            }
+        }
+        let mut pairs: Vec<(usize, usize, usize, usize)> = Vec::new();
+        let mut used = vec![false; faces.len()];
+        for sites in located.values() {
+            if sites.len() != 2 {
+                continue;
+            }
+            let (fa, ea, da) = sites[0];
+            let (fb, eb, db) = sites[1];
+            if fa == fb || used.get(fa).copied().unwrap_or(true) || used.get(fb).copied().unwrap_or(true) || da == db {
+                continue;
+            }
+            let (Some(left), Some(right)) = (faces.get(fa), faces.get(fb)) else { continue };
+            if !coplanar_pair(left, right, tol, cos_ang) {
+                continue;
+            }
+            if let Some(slot) = used.get_mut(fa) {
+                *slot = true;
+            }
+            if let Some(slot) = used.get_mut(fb) {
+                *slot = true;
+            }
+            pairs.push((fa, ea, fb, eb));
+        }
+        if pairs.is_empty() {
+            break;
+        }
+        pairs.sort_by(|a, b| b.0.max(b.2).cmp(&a.0.max(a.2)));
+        let mut merged = 0usize;
+        for pair_i in 0..pairs.len() {
+            let (fa, ea, fb, eb) = pairs[pair_i];
+            let Some(gone) = merge_plane_pair(faces, origins, fa, ea, fb, eb) else { continue };
+            merged += 1;
+            for later in pairs.iter_mut().skip(pair_i + 1) {
+                if later.0 > gone {
+                    later.0 -= 1;
+                }
+                if later.2 > gone {
+                    later.2 -= 1;
+                }
+            }
+        }
+        if merged == 0 {
+            break;
+        }
+    }
+}
+
+fn coplanar_pair(left: &FaceSpec, right: &FaceSpec, tol: f64, cos_ang: f64) -> bool {
+    let (Some(nl), Some(nr)) = (face_plane_normal(left), face_plane_normal(right)) else { return false };
+    if nl.dot(nr) < cos_ang {
+        return false;
+    }
+    let mut pts = Vec::new();
+    for face in [left, right] {
+        for edge in face.loops.iter().flatten() {
+            if let Some((a, _)) = line_ends(edge) {
+                pts.push(a);
+            }
+        }
+    }
+    if pts.len() < 3 {
+        return false;
+    }
+    let c = pts.iter().fold(Vec3::ZERO, |sum, p| sum + *p) * (1.0 / pts.len() as f64);
+    let mut n = Vec3::ZERO;
+    for pair in pts.windows(2) {
+        let (Some(a), Some(b)) = (pair.first(), pair.get(1)) else { continue };
+        n += (*a - c).cross(*b - c);
+    }
+    if let (Some(a), Some(b)) = (pts.first(), pts.last()) {
+        n += (*b - c).cross(*a - c);
+    }
+    let Some(nn) = n.normalized() else { return false };
+    let d = c.dot(nn);
+    pts.iter().all(|p| (p.dot(nn) - d).abs() <= tol)
+}
+
+/// Pull each planar corner onto the planes of the faces that use it, moving at most `tol`.
+/// Shared corners stay one point, so the shell still meets, and truck can attach the plane.
+fn flatten_plane_corners(faces: &mut [FaceSpec], tol: f64) {
+    if !(tol.is_finite() && tol > 0.0) {
+        return;
+    }
+    let planes: Vec<Option<(Vec3, f64)>> = faces.iter().map(face_plane_nd).collect();
+    let mut groups: HashMap<(i64, i64, i64), Vec<(usize, usize, usize, bool)>> = HashMap::new();
+    for (fi, face) in faces.iter().enumerate() {
+        if !matches!(face.surface, SurfSpec::Plane) {
+            continue;
+        }
+        for (li, lp) in face.loops.iter().enumerate() {
+            for (ei, edge) in lp.iter().enumerate() {
+                let EdgeSpec::Line { a, b } = edge else { continue };
+                groups.entry(quant_pt(*a)).or_default().push((fi, li, ei, false));
+                groups.entry(quant_pt(*b)).or_default().push((fi, li, ei, true));
+            }
+        }
+    }
+    let mut updates: Vec<((usize, usize, usize, bool), Vec3)> = Vec::new();
+    for uses in groups.values() {
+        let Some(&(fi, li, ei, is_b)) = uses.first() else { continue };
+        let Some(p0) = line_end_at(faces, fi, li, ei, is_b) else { continue };
+        let mut seen: Vec<(Vec3, f64)> = Vec::new();
+        for &(fj, _, _, _) in uses {
+            let Some(Some((n, d))) = planes.get(fj) else { continue };
+            if seen.iter().any(|(nn, dd)| nn.dot(*n) > 0.9999 && (d - dd).abs() < 1e-9) {
+                continue;
+            }
+            seen.push((*n, *d));
+        }
+        let p = project_onto_planes(p0, &seen);
+        if !p.is_finite() || p.dist(p0) > tol {
+            continue;
+        }
+        for &site in uses {
+            updates.push((site, p));
+        }
+    }
+    for ((fi, li, ei, is_b), p) in updates {
+        set_line_end(faces, fi, li, ei, is_b, p);
+    }
+}
+
+fn face_plane_nd(face: &FaceSpec) -> Option<(Vec3, f64)> {
+    if !matches!(face.surface, SurfSpec::Plane) {
+        return None;
+    }
+    let n = face_plane_normal(face)?;
+    let mut c = Vec3::ZERO;
+    let mut count = 0.0;
+    for edge in face.loops.iter().flatten() {
+        if let Some((a, _)) = line_ends(edge) {
+            c += a;
+            count += 1.0;
+        }
+    }
+    if count < 3.0 {
+        return None;
+    }
+    c = c * (1.0 / count);
+    Some((n, c.dot(n)))
+}
+
+fn line_end_at(faces: &[FaceSpec], fi: usize, li: usize, ei: usize, is_b: bool) -> Option<Vec3> {
+    let edge = faces.get(fi)?.loops.get(li)?.get(ei)?;
+    let (a, b) = line_ends(edge)?;
+    Some(if is_b { b } else { a })
+}
+
+fn set_line_end(faces: &mut [FaceSpec], fi: usize, li: usize, ei: usize, is_b: bool, p: Vec3) {
+    let Some(edge) = faces.get_mut(fi).and_then(|face| face.loops.get_mut(li)).and_then(|lp| lp.get_mut(ei)) else { return };
+    if let EdgeSpec::Line { a, b } = edge {
+        if is_b { *b = p } else { *a = p }
+    }
+}
+
+fn project_onto_planes(p: Vec3, planes: &[(Vec3, f64)]) -> Vec3 {
+    if planes.is_empty() {
+        return p;
+    }
+    if let [(n, d)] = planes {
+        return p - *n * (p.dot(*n) - d);
+    }
+    // Soft constraints: stay near p and on every plane that meets here.
+    let w = 1.0e8;
+    let mut a = [[0.0; 3]; 3];
+    a[0][0] = 1.0;
+    a[1][1] = 1.0;
+    a[2][2] = 1.0;
+    let mut rhs = [p.x, p.y, p.z];
+    for (n, d) in planes {
+        let nrm = [n.x, n.y, n.z];
+        for row in 0..3 {
+            for col in 0..3 {
+                a[row][col] += w * nrm[row] * nrm[col];
+            }
+            rhs[row] += w * d * nrm[row];
+        }
+    }
+    solve3(a, rhs).map(|s| Vec3::new(s[0], s[1], s[2])).unwrap_or(p)
+}
+
+fn face_plane_normal(face: &FaceSpec) -> Option<Vec3> {
+    let mut pts = Vec::new();
+    for edge in face.loops.iter().flatten() {
+        if let Some((a, _)) = line_ends(edge) {
+            pts.push(a);
+        }
+    }
+    if pts.len() < 3 {
+        return None;
+    }
+    let c = pts.iter().fold(Vec3::ZERO, |sum, p| sum + *p) * (1.0 / pts.len() as f64);
+    let mut n = Vec3::ZERO;
+    for pair in pts.windows(2) {
+        let (Some(a), Some(b)) = (pair.first(), pair.get(1)) else { continue };
+        n += (*a - c).cross(*b - c);
+    }
+    if let (Some(a), Some(b)) = (pts.first(), pts.last()) {
+        n += (*b - c).cross(*a - c);
+    }
+    n.normalized()
+}
+
+fn merge_plane_pair(faces: &mut Vec<FaceSpec>, origins: &mut Vec<Vec<usize>>, fa: usize, ea: usize, fb: usize, eb: usize) -> Option<usize> {
+    let (host, he, other, oe) = if fa < fb { (fa, ea, fb, eb) } else { (fb, eb, fa, ea) };
+    let Some(host_loop) = faces.get(host).and_then(|face| face.loops.first()).cloned() else { return None };
+    let Some(other_loop) = faces.get(other).and_then(|face| face.loops.first()).cloned() else { return None };
+    if he >= host_loop.len() || oe >= other_loop.len() || host_loop.len() + other_loop.len() > MAX_LOOP_EDGES {
+        return None;
+    }
+    let Some((ha, hb)) = line_ends(&host_loop[he]) else { return None };
+    let Some((oa, ob)) = line_ends(&other_loop[oe]) else { return None };
+    let mut bridge: Vec<EdgeSpec> = (1..other_loop.len()).map(|k| other_loop[(oe + k) % other_loop.len()].clone()).collect();
+    let opposite = quant_pt(oa) == quant_pt(hb) && quant_pt(ob) == quant_pt(ha);
+    let same = quant_pt(oa) == quant_pt(ha) && quant_pt(ob) == quant_pt(hb);
+    if same {
+        reverse_loop(&mut bridge);
+    } else if !opposite {
+        return None;
+    }
+    let mut new_loop = Vec::with_capacity(host_loop.len() + bridge.len());
+    new_loop.extend(host_loop[..he].iter().cloned());
+    new_loop.extend(bridge);
+    new_loop.extend(host_loop[he + 1..].iter().cloned());
+    if !loop_is_simple(&new_loop) {
+        return None;
+    }
+    if let Some(lp) = faces.get_mut(host).and_then(|face| face.loops.get_mut(0)) {
+        *lp = new_loop;
+    } else {
+        return None;
+    }
+    if host < origins.len() && other < origins.len() {
+        let extra = origins[other].clone();
+        origins[host].extend(extra);
+    }
+    faces.remove(other);
+    if other < origins.len() {
+        origins.remove(other);
+    }
+    Some(other)
+}
+
 fn line_ends(edge: &EdgeSpec) -> Option<(Vec3, Vec3)> {
     match edge {
         EdgeSpec::Line { a, b } => Some((*a, *b)),
@@ -1252,8 +2458,70 @@ fn line_ends(edge: &EdgeSpec) -> Option<(Vec3, Vec3)> {
 }
 
 fn unify_near_corners(faces: &mut [FaceSpec], tol: f64) {
+    let Some((reps, bins)) = corner_reps(faces, tol) else { return };
+    apply_corner_reps(faces, &reps, &bins, tol);
+}
+
+/// Move `loose` corners onto corners already chosen on `anchors`. Plane wires stay put;
+/// an open-cylinder end that sits a few hundredths of a micrometre off then shares the edge.
+fn snap_partial_corners(loose: &mut [FaceSpec], anchors: &[FaceSpec], tol: f64) {
     if !(tol.is_finite() && tol > 0.0) {
         return;
+    }
+    let mut reps: Vec<Vec3> = Vec::new();
+    for face in anchors {
+        if !matches!(face.surface, SurfSpec::Plane) {
+            continue;
+        }
+        for edge in face.loops.iter().flatten() {
+            let Some((a, b)) = line_ends(edge) else { continue };
+            for p in [a, b] {
+                if reps.iter().any(|r| r.dist(p) <= 1e-6) {
+                    continue;
+                }
+                reps.push(p);
+            }
+        }
+    }
+    if reps.is_empty() {
+        return;
+    }
+    let nearest = |p: Vec3| -> Option<Vec3> {
+        let mut best: Option<(f64, Vec3)> = None;
+        let mut second = f64::INFINITY;
+        for r in &reps {
+            let d = r.dist(p);
+            if best.is_some_and(|(bd, _)| d < bd) || best.is_none() {
+                second = best.map(|(bd, _)| bd).unwrap_or(f64::INFINITY);
+                best = Some((d, *r));
+            } else if d < second {
+                second = d;
+            }
+        }
+        let (d, r) = best?;
+        if d <= tol && second > d * 3.0 && second > 1e-4 { Some(r) } else { None }
+    };
+    for face in loose.iter_mut() {
+        for edge in face.loops.iter_mut().flatten() {
+            let EdgeSpec::Line { a, b } = edge else { continue };
+            let na = nearest(*a);
+            let nb = nearest(*b);
+            if na.is_some_and(|p| nb.is_some_and(|q| p.dist(q) < 1e-6)) {
+                continue;
+            }
+            if let Some(p) = na {
+                *a = p;
+            }
+            if let Some(p) = nb {
+                *b = p;
+            }
+        }
+    }
+}
+
+fn corner_reps(faces: &[FaceSpec], tol: f64) -> Option<(Vec<Vec3>, HashMap<(i64, i64, i64), Vec<usize>>)> {
+    if !(tol.is_finite() && tol > 0.0) {
+        return None;
     }
     let mut reps: Vec<Vec3> = Vec::new();
     let mut bins: HashMap<(i64, i64, i64), Vec<usize>> = HashMap::new();
@@ -1276,7 +2544,7 @@ fn unify_near_corners(faces: &mut [FaceSpec], tol: f64) {
         reps.push(p);
         bins.entry(k).or_default().push(id);
     };
-    for face in faces.iter() {
+    for face in faces {
         for edge in face.loops.iter().flatten() {
             match edge {
                 EdgeSpec::Line { a, b } | EdgeSpec::Arc { a, b, .. } => {
@@ -1294,6 +2562,11 @@ fn unify_near_corners(faces: &mut [FaceSpec], tol: f64) {
             }
         }
     }
+    Some((reps, bins))
+}
+
+fn apply_corner_reps(faces: &mut [FaceSpec], reps: &[Vec3], bins: &HashMap<(i64, i64, i64), Vec<usize>>, tol: f64) {
+    let key = |p: Vec3| ((p.x / tol).round() as i64, (p.y / tol).round() as i64, (p.z / tol).round() as i64);
     let canon = |p: Vec3| -> Vec3 {
         let k = key(p);
         let mut best: Option<Vec3> = None;
@@ -1352,7 +2625,7 @@ fn face_not_a_plane(face: &FaceSpec) -> bool {
         return false;
     }
     let (nlen, dev) = face_plane_metrics(face);
-    nlen < 1e-6 || dev > 1e-6
+    nlen < 1e-7 || dev > 1e-7
 }
 
 fn face_plane_metrics(face: &FaceSpec) -> (f64, f64) {
@@ -1437,6 +2710,79 @@ fn edges_on_plane(edges: &[EdgeSpec], n: Vec3, d: f64) -> bool {
     })
 }
 
+#[cfg(test)]
+fn rim_plane_gap(edges: &[EdgeSpec], n: Vec3, d: f64) -> f64 {
+    let mut gap = 0.0_f64;
+    for edge in edges {
+        let pts = match edge {
+            EdgeSpec::Line { a, b } => [*a, *b, *b],
+            EdgeSpec::Arc { a, b, mid } => [*a, *b, *mid],
+            EdgeSpec::Chain { ctrl, .. } => [*ctrl.first().unwrap_or(&Vec3::ZERO), *ctrl.last().unwrap_or(&Vec3::ZERO), Vec3::ZERO],
+        };
+        for p in pts {
+            gap = gap.max((p.dot(n) - d).abs());
+        }
+    }
+    gap
+}
+
+fn circle_near_plane(edges: &[EdgeSpec], n: Vec3, d: f64) -> bool {
+    edges.iter().all(|edge| match edge {
+        EdgeSpec::Arc { a, b, mid } => [a, b, mid].iter().all(|p| (p.dot(n) - d).abs() < 0.05),
+        EdgeSpec::Line { a, b } => (a.dot(n) - d).abs() < 0.05 && (b.dot(n) - d).abs() < 0.05,
+        EdgeSpec::Chain { ctrl, .. } => ctrl.iter().all(|p| (p.dot(n) - d).abs() < 0.05),
+    })
+}
+
+fn snap_edge_plane(edge: &mut EdgeSpec, n: Vec3, d: f64) {
+    let snap = |p: &mut Vec3| {
+        let k = p.dot(n) - d;
+        *p -= n * k;
+    };
+    match edge {
+        EdgeSpec::Line { a, b } => {
+            snap(a);
+            snap(b);
+        }
+        EdgeSpec::Arc { a, b, mid } => {
+            snap(a);
+            snap(b);
+            snap(mid);
+        }
+        EdgeSpec::Chain { ctrl, .. } => {
+            let mut pts: Vec<Vec3> = ctrl.iter().copied().collect();
+            for p in &mut pts {
+                snap(p);
+            }
+            *ctrl = pts.into();
+        }
+    }
+}
+
+/// The cap locked to this rim, if one plane owns it.
+fn rim_plane(planes: &[HeldPlane], owners: &[Vec<usize>], rim: &[u32]) -> Option<(Vec3, f64)> {
+    let mut votes: HashMap<usize, usize> = HashMap::new();
+    for &vi in rim {
+        if let Some(ids) = owners.get(vi as usize) {
+            for &pi in ids {
+                *votes.entry(pi).or_default() += 1;
+            }
+        }
+    }
+    let (&pi, _) = votes.iter().max_by_key(|(_, c)| *c)?;
+    let plane = planes.get(pi)?;
+    Some((plane.n, plane.d))
+}
+
+fn loop_meets_leftover(lp: &[u32], edges: &HashSet<(u32, u32)>) -> bool {
+    if lp.len() < 2 {
+        return false;
+    }
+    let closes = lp.windows(2).any(|w| edges.contains(&(w[0].min(w[1]), w[0].max(w[1]))));
+    let Some(&last) = lp.last() else { return closes };
+    closes || edges.contains(&(lp[0].min(last), lp[0].max(last)))
+}
+
 fn planar_face(
     mesh: &TriMesh,
     positions: &[Vec3],
@@ -1446,6 +2792,7 @@ fn planar_face(
     _circles: &HashMap<CircleKey, Vec<EdgeSpec>>,
     by_rim: &HashMap<Vec<u32>, Vec<EdgeSpec>>,
     keep_verts: &HashSet<u32>,
+    leftover_edges: &HashSet<(u32, u32)>,
     plane: Option<PlaneFit>,
     used_rims: &mut HashSet<Vec<u32>>,
 ) -> Result<FaceSpec> {
@@ -1509,8 +2856,31 @@ fn planar_face(
         // Replacing it with a fitted circle would not meet the triangle.
         let mut rim_key = lp.clone();
         rim_key.sort_unstable();
+        let edge_blocked = loop_meets_leftover(&lp, leftover_edges);
+        #[cfg(test)]
+        if !by_rim.is_empty() {
+            let here: HashSet<u32> = lp.iter().copied().collect();
+            let mut best = 0usize;
+            for key in by_rim.keys() {
+                let hit = key.iter().filter(|v| here.contains(v)).count();
+                best = best.max(hit.saturating_mul(1000) / key.len().max(1));
+            }
+            if let Some(edges) = by_rim.get(&rim_key) {
+                best = if edge_blocked {
+                    3000
+                } else if !edges_on_plane(edges, n, plane.d) {
+                    let dev = rim_plane_gap(edges, n, plane.d);
+                    10_000 + (dev * 1.0e6).min(1.0e6) as usize
+                } else {
+                    2000
+                };
+            }
+            recognize_stats::note_overlap(best);
+        }
         let touches_leftover = lp.iter().any(|i| keep_verts.contains(i));
-        let from_rim = if touches_leftover { None } else { by_rim.get(&rim_key).filter(|edges| edges_on_plane(edges, n, plane.d)).cloned() };
+        // A leftover triangle that only shares a rim vertex still has its own edges.
+        // The circle is refused only when a leftover triangle owns one of this loop's edges.
+        let from_rim = if edge_blocked { None } else { by_rim.get(&rim_key).filter(|edges| edges_on_plane(edges, n, plane.d)).cloned() };
         let edges = if let Some(edges) = from_rim {
             hit_rims.push(rim_key);
             edges
@@ -1613,11 +2983,11 @@ fn loop_is_simple(edges: &[EdgeSpec]) -> bool {
     }
     for i in 0..n {
         let (a, b) = (pts[i], pts[(i + 1) % n]);
-        for j in 0..n {
+        for (j, point) in pts.iter().enumerate().take(n) {
             if j == i || j == (i + 1) % n {
                 continue;
             }
-            if point_line_dist(pts[j], a, b) <= 1e-6 {
+            if point_line_dist(*point, a, b) <= 1e-6 {
                 return false;
             }
         }
@@ -1685,6 +3055,32 @@ struct PendingTube {
     rim1: Vec<u32>,
 }
 
+/// A cylinder wall that does not close into a tube: a channel or a half-round.
+/// Its boundary is the mesh polyline, so neighbouring faces share those edges.
+struct PartialCyl {
+    cluster: Vec<usize>,
+    cyl: CylFit,
+}
+
+struct PendingCone {
+    cluster: Vec<usize>,
+    axis: Vec3,
+    apex: Vec3,
+    t0: f64,
+    t1: f64,
+    r0: f64,
+    r1: f64,
+    rim0: Vec<u32>,
+    rim1: Vec<u32>,
+}
+
+impl PendingCone {
+    /// A cylinder record so the rim lock can place the cap on this circle.
+    fn cyl_at(&self, _t: f64, radius: f64) -> CylFit {
+        CylFit { axis: self.axis, origin: self.apex, radius }
+    }
+}
+
 fn fit_cluster_plane(mesh: &TriMesh, normals: &[Vec3], cluster: &[usize]) -> Option<PlaneFit> {
     let mut n = Vec3::ZERO;
     let mut c = Vec3::ZERO;
@@ -1707,7 +3103,13 @@ fn fit_cluster_plane(mesh: &TriMesh, normals: &[Vec3], cluster: &[usize]) -> Opt
 
 fn try_pending_tube(mesh: &TriMesh, cluster: &[usize], cyl: &CylFit, tolerance: f64) -> Result<Option<PendingTube>> {
     let loops = boundary_loops(mesh, cluster)?;
+    let loops: Vec<_> = loops.into_iter().filter(|lp| lp.len() >= 6).collect();
     if loops.len() != 2 {
+        #[cfg(test)]
+        {
+            recognize_stats::add(recognize_stats::loops());
+            recognize_stats::note_boundary(loops.len(), cluster.len());
+        }
         return Ok(None);
     }
     let mut rims = Vec::new();
@@ -1725,6 +3127,8 @@ fn try_pending_tube(mesh: &TriMesh, cluster: &[usize], cyl: &CylFit, tolerance: 
         let h = hsum / count;
         let flat = lp.iter().all(|&i| mesh.positions.get(i as usize).is_some_and(|p| ((*p - cyl.origin).dot(cyl.axis) - h).abs() <= tolerance * 4.));
         if !h.is_finite() || !flat {
+            #[cfg(test)]
+            recognize_stats::add(recognize_stats::flat());
             return Ok(None);
         }
         rims.push((h, lp));
@@ -1736,7 +3140,76 @@ fn try_pending_tube(mesh: &TriMesh, cluster: &[usize], cyl: &CylFit, tolerance: 
     if h1 - h0 <= tolerance {
         return Ok(None);
     }
+    // A semicircular rim has the same vertex count as a cap. Treating it as a full
+    // circle closes the missing half and the solid is a complete cylinder.
+    if !rim_covers_the_turn(mesh, &rim0, cyl) || !rim_covers_the_turn(mesh, &rim1, cyl) {
+        return Ok(None);
+    }
     Ok(Some(PendingTube { cluster: cluster.to_vec(), cyl: *cyl, h0, h1, rim0, rim1 }))
+}
+
+/// The rim runs the whole way around the axis. One facet may be missing; a half-round may not.
+fn rim_covers_the_turn(mesh: &TriMesh, rim: &[u32], cyl: &CylFit) -> bool {
+    let Some(axis) = cyl.axis.normalized() else { return false };
+    let u = axis.any_perp();
+    let v = axis.cross(u);
+    let mut angles = Vec::new();
+    for &i in rim {
+        let Some(p) = mesh.positions.get(i as usize) else { continue };
+        let d = *p - cyl.origin;
+        let radial = d - axis * d.dot(axis);
+        if radial.len() < cyl.radius * 0.5 {
+            continue;
+        }
+        angles.push(radial.dot(v).atan2(radial.dot(u)));
+    }
+    let Some((_, gap, span)) = angular_opening(&angles) else { return false };
+    gap < 0.55 && span > TAU - 0.55
+}
+
+fn try_pending_cone(mesh: &TriMesh, cluster: &[usize], cone: &ConeFit, tolerance: f64) -> Result<Option<PendingCone>> {
+    let loops = boundary_loops(mesh, cluster)?;
+    if loops.len() != 2 {
+        return Ok(None);
+    }
+    let mut rims = Vec::new();
+    for lp in loops {
+        let mut hsum = 0.0;
+        let mut count = 0.0;
+        for &i in &lp {
+            let Some(p) = mesh.positions.get(i as usize) else { continue };
+            hsum += (*p - cone.apex).dot(cone.axis);
+            count += 1.;
+        }
+        if count < 6. {
+            return Ok(None);
+        }
+        let t = hsum / count;
+        let flat = lp.iter().all(|&i| mesh.positions.get(i as usize).is_some_and(|p| ((*p - cone.apex).dot(cone.axis) - t).abs() <= tolerance * 4.));
+        if !t.is_finite() || t <= tolerance || !flat {
+            return Ok(None);
+        }
+        let radius = cone.slope * t;
+        let round = lp.iter().all(|&i| {
+            mesh.positions.get(i as usize).is_some_and(|p| {
+                let d = *p - cone.apex;
+                let h = d.dot(cone.axis);
+                (d - cone.axis * h).len() - radius < tolerance * 4. && radius - (d - cone.axis * h).len() < tolerance * 4.
+            })
+        });
+        if !round || radius <= tolerance {
+            return Ok(None);
+        }
+        rims.push((t, radius, lp));
+    }
+    rims.sort_by(|a, b| a.0.total_cmp(&b.0));
+    let (Some((t0, r0, rim0)), Some((t1, r1, rim1))) = (rims.first().cloned(), rims.get(1).cloned()) else {
+        return Ok(None);
+    };
+    if t1 - t0 <= tolerance || (r0 - r1).abs() <= tolerance * 2. {
+        return Ok(None);
+    }
+    Ok(Some(PendingCone { cluster: cluster.to_vec(), axis: cone.axis, apex: cone.apex, t0, t1, r0, r1, rim0, rim1 }))
 }
 
 fn plane_owners(mesh: &TriMesh, planes: &[HeldPlane]) -> Vec<Vec<usize>> {
@@ -2073,6 +3546,144 @@ fn merge_coplanar_planes(mesh: &TriMesh, normals: &[Vec3], planes: &mut Vec<Held
     *planes = rebuilt;
 }
 
+/// Largest empty angle around the axis, and the span of the wall on the other side.
+/// `gap_at` is the start of the empty sector. Fewer than four distinct angles is not a wall.
+fn angular_opening(angles: &[f64]) -> Option<(f64, f64, f64)> {
+    if angles.len() < 4 {
+        return None;
+    }
+    let mut uniq: Vec<f64> = angles.iter().copied().filter(|a| a.is_finite()).collect();
+    if uniq.len() < 4 {
+        return None;
+    }
+    uniq.sort_by(|a, b| a.total_cmp(b));
+    let mut collapsed = Vec::with_capacity(uniq.len());
+    collapsed.push(uniq[0]);
+    for a in uniq.into_iter().skip(1) {
+        if let Some(prev) = collapsed.last().copied()
+            && a - prev > 1e-3
+        {
+            collapsed.push(a);
+        }
+    }
+    if collapsed.len() < 4 {
+        return None;
+    }
+    let mut best_gap = 0.0;
+    let mut gap_at = collapsed[0];
+    for pair in collapsed.windows(2) {
+        let (Some(left), Some(right)) = (pair.first().copied(), pair.get(1).copied()) else { continue };
+        let g = right - left;
+        if g > best_gap {
+            best_gap = g;
+            gap_at = left;
+        }
+    }
+    let (Some(first), Some(last)) = (collapsed.first().copied(), collapsed.last().copied()) else {
+        return None;
+    };
+    let wrap = first + TAU - last;
+    if wrap > best_gap {
+        best_gap = wrap;
+        gap_at = last;
+    }
+    let span = TAU - best_gap;
+    (span.is_finite() && best_gap.is_finite()).then_some((gap_at, best_gap, span))
+}
+
+/// The wall leaves a real opening around its axis (a channel or a half-round), so it can be
+/// one face without wrapping the parameter seam. A complete tube's only gap is one facet.
+fn cylinder_opens_wide(mesh: &TriMesh, cluster: &[usize], cyl: &CylFit) -> bool {
+    let Ok(loops) = boundary_loops(mesh, cluster) else { return false };
+    if loops.is_empty() || loops.len() > 32 {
+        return false;
+    }
+    let Some(axis) = cyl.axis.normalized() else { return false };
+    let u = axis.any_perp();
+    let v = axis.cross(u);
+    let mut angles = Vec::new();
+    for lp in &loops {
+        if lp.len() > MAX_LOOP_EDGES {
+            return false;
+        }
+        for &i in lp {
+            let Some(p) = mesh.positions.get(i as usize) else { continue };
+            let d = *p - cyl.origin;
+            let radial = d - axis * d.dot(axis);
+            if radial.len() < cyl.radius * 0.5 {
+                continue;
+            }
+            angles.push(radial.dot(v).atan2(radial.dot(u)));
+        }
+    }
+    let Some((_, gap, span)) = angular_opening(&angles) else { return false };
+    gap >= 0.45 && span >= 0.4 && span < TAU - 0.2
+}
+
+/// One revolved face for an open cylinder. The boundary is every mesh edge, so a
+/// neighbouring plane or triangle meets it on the same line.
+fn partial_cylinder_face(mesh: &TriMesh, positions: &[Vec3], cluster: &[usize], cyl: &CylFit) -> Result<FaceSpec> {
+    let loops = boundary_loops(mesh, cluster)?;
+    if loops.is_empty() || loops.len() > 32 {
+        return Err(invalid("cylindrical region is not an open patch"));
+    }
+    let Some(axis) = cyl.axis.normalized() else {
+        return Err(invalid("cylindrical region is not an open patch"));
+    };
+    let u = axis.any_perp();
+    let v = axis.cross(u);
+    let mut angles = Vec::new();
+    let mut t_lo = f64::INFINITY;
+    let mut t_hi = f64::NEG_INFINITY;
+    let mut edge_loops = Vec::new();
+    for lp in &loops {
+        let mut pts = Vec::with_capacity(lp.len());
+        for &i in lp {
+            let Some(p) = positions.get(i as usize).copied() else {
+                return Err(invalid("missing vertex"));
+            };
+            let d = p - cyl.origin;
+            let t = d.dot(axis);
+            t_lo = t_lo.min(t);
+            t_hi = t_hi.max(t);
+            let radial = d - axis * t;
+            if radial.len() >= cyl.radius * 0.5 {
+                angles.push(radial.dot(v).atan2(radial.dot(u)));
+            }
+            pts.push(p);
+        }
+        edge_loops.push(polyline_to_lines(&pts, 0.0)?);
+    }
+    let Some((gap_at, gap, span)) = angular_opening(&angles) else {
+        return Err(invalid("cylindrical region is not an open patch"));
+    };
+    if gap < 0.45 || span < 0.4 || !(t_hi - t_lo).is_finite() || t_hi - t_lo < 1e-4 {
+        return Err(invalid("cylindrical region is not an open patch"));
+    }
+    if !boundaries_disjoint(&edge_loops) {
+        return Err(invalid("wire is not simple"));
+    }
+    for edges in &edge_loops {
+        if !loop_is_simple(edges) {
+            return Err(invalid("wire is not simple"));
+        }
+    }
+    let start = gap_at + gap;
+    let sweep = (span + 1e-3).min(TAU - 1e-3);
+    let dir = u * start.cos() + v * start.sin();
+    let a = cyl.origin + axis * t_lo + dir * cyl.radius;
+    let b = cyl.origin + axis * t_hi + dir * cyl.radius;
+    let mid_ang = start + span * 0.5;
+    let mid_dir = u * mid_ang.cos() + v * mid_ang.sin();
+    let probe = cyl.origin + axis * ((t_lo + t_hi) * 0.5) + mid_dir * cyl.radius;
+    let outward = if material_away_from_axis(mesh, cluster, cyl) { mid_dir } else { -mid_dir };
+    Ok(FaceSpec {
+        loops: edge_loops,
+        surface: SurfSpec::Revolved { a, b, axis_origin: cyl.origin, axis, angle: sweep },
+        probe: Some((probe, outward)),
+    })
+}
+
 fn cylinder_face(
     mesh: &TriMesh,
     cluster: &[usize],
@@ -2115,6 +3726,51 @@ fn cylinder_face(
     half_cylinder_walls(&bot, cyl.origin, cyl.axis * height, material_away_from_axis(mesh, cluster, cyl))
 }
 
+fn cone_face(mesh: &TriMesh, cone: &PendingCone, circles: &mut HashMap<CircleKey, Vec<EdgeSpec>>) -> Result<Vec<FaceSpec>> {
+    let bot = register_circle(circles, cone.axis, cone.apex + cone.axis * cone.t0, cone.r0, 0.3)?;
+    let top = register_circle(circles, cone.axis, cone.apex + cone.axis * cone.t1, cone.r1, 0.3)?;
+    let cyl = CylFit { axis: cone.axis, origin: cone.apex, radius: cone.r0.max(cone.r1) };
+    cone_walls(&bot, &top, cone.apex, cone.axis, material_away_from_axis(mesh, &cone.cluster, &cyl))
+}
+
+/// Wall faces of a frustum. Each wall revolves the slanted generator between one arc of the
+/// small circle and the matching arc of the large circle.
+fn cone_walls(bot: &[EdgeSpec], top: &[EdgeSpec], apex: Vec3, axis: Vec3, away_from_axis: bool) -> Result<Vec<FaceSpec>> {
+    if bot.len() != top.len() || bot.len() < 2 {
+        return Err(invalid("cone circle must have at least two arcs"));
+    }
+    let axis = axis.normalized().ok_or_else(|| invalid("cone axis"))?;
+    let angle = TAU / bot.len() as f64;
+    let mut walls = Vec::with_capacity(bot.len());
+    for (arc, top_arc) in bot.iter().zip(top) {
+        let EdgeSpec::Arc { a, b, mid } = arc else {
+            return Err(invalid("cone circle arcs"));
+        };
+        let EdgeSpec::Arc { a: ta, b: tb, mid: tm } = top_arc else {
+            return Err(invalid("cone circle arcs"));
+        };
+        let m = (*mid + *tm) * 0.5;
+        let radial = m - apex - axis * (m - apex).dot(axis);
+        let away = radial.normalized().unwrap_or(Vec3::X);
+        let outward = if away_from_axis { away } else { -away };
+        let mut boundary = vec![
+            EdgeSpec::Arc { a: *a, b: *b, mid: *mid },
+            EdgeSpec::Line { a: *b, b: *tb },
+            EdgeSpec::Arc { a: *tb, b: *ta, mid: *tm },
+            EdgeSpec::Line { a: *ta, b: *a },
+        ];
+        if !away_from_axis {
+            reverse_loop(&mut boundary);
+        }
+        walls.push(FaceSpec {
+            loops: vec![boundary],
+            surface: SurfSpec::Revolved { a: *a, b: *ta, axis_origin: apex, axis, angle },
+            probe: Some((m, outward)),
+        });
+    }
+    Ok(walls)
+}
+
 /// Quantized key so cap holes and cylinder walls share one circle EdgeSpec list.
 #[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
 struct CircleKey {
@@ -2135,8 +3791,8 @@ fn circle_key(axis: Vec3, center: Vec3, radius: f64) -> CircleKey {
 
 /// Full circle about `axis` through `center` as `n_arcs` equal arcs (`n_arcs` ≥ 2).
 fn exact_circle_edges_n(center: Vec3, axis: Vec3, radius: f64, phase: f64, n_arcs: usize) -> Option<Vec<EdgeSpec>> {
-    let Some(axis) = axis.normalized() else { return None };
-    if !(radius.is_finite() && radius > 0.) || n_arcs < 2 || n_arcs > 64 {
+    let axis = axis.normalized()?;
+    if !(radius.is_finite() && radius > 0.) || !(2..=64).contains(&n_arcs) {
         return None;
     }
     let u = axis.any_perp();
@@ -2680,7 +4336,7 @@ fn try_full_circle(pts: &[Vec3], n: Vec3, tolerance: f64) -> Option<Vec<EdgeSpec
     }
     // Two half-arcs.
     let x = (pts[0] - center) - n * (pts[0] - center).dot(n);
-    let Some(x) = x.normalized() else { return None };
+    let x = x.normalized()?;
     let y = n.cross(x);
     let a = center + x * r;
     let b = center - x * r;
@@ -2770,7 +4426,7 @@ fn orient_planar_loops(loops: &mut [Vec<EdgeSpec>], outward: Vec3) {
     }
 }
 
-fn reverse_loop(edges: &mut Vec<EdgeSpec>) {
+fn reverse_loop(edges: &mut [EdgeSpec]) {
     edges.reverse();
     for e in edges.iter_mut() {
         *e = match e {
@@ -2796,6 +4452,85 @@ mod tests {
     }
 
     #[test]
+    fn a_box_mesh_labels_its_faces_as_planes() {
+        let source = crate::box_solid(Vec3::ZERO, Vec3::new(10., 20., 30.)).unwrap();
+        let mesh = mesh_of(&source);
+        let groups = label_mesh(&mesh, &crate::mesh_convert::ConvertOptions::from_tolerance(0.05)).unwrap();
+        assert_eq!(groups.groups.len(), groups.triangles.len());
+        assert!(groups.groups.iter().any(|g| *g == FaceGroup::Plane));
+        assert!(groups.groups.iter().all(|g| *g == FaceGroup::Plane));
+    }
+
+    /// A closed mesh the folder converter sews, except for edges that collapse under
+    /// the corner weld. Absent on a machine without the file, so CI skips it.
+    #[test]
+    fn probe_holder_stl_converts_to_a_solid() {
+        let path = r"C:\Users\aidenleefaulconer\Downloads\tst\probe-holder.stl";
+        let Ok(bytes) = std::fs::read(path) else { return };
+        recognize_stats::reset();
+        let mesh = stl_body(&bytes);
+        let solid = crate::convert_mesh(&mesh, 0.02).unwrap_or_else(|e| panic!("{e}"));
+        let stats = recognize_stats::line();
+        assert!(!solid.is_mesh());
+        let measured = crate::measure(&solid).unwrap();
+        let volume = measured.volume;
+        eprintln!("probe-holder faces {:?} {stats}", measured.merged.face_types);
+        assert!((volume - 2953.874).abs() < 150.0, "volume {volume}, faces {:?}", measured.merged.face_types);
+    }
+
+    #[test]
+    fn analytic_frustum_recovers_a_cone() {
+        let (n, r0, r1, h) = (48usize, 10.0_f64, 4.0, 12.0);
+        let mut positions = vec![Vec3::new(0., 0., 0.), Vec3::new(0., 0., h)];
+        for i in 0..n {
+            let a = TAU * i as f64 / n as f64;
+            positions.push(Vec3::new(r0 * a.cos(), r0 * a.sin(), 0.));
+            positions.push(Vec3::new(r1 * a.cos(), r1 * a.sin(), h));
+        }
+        let mut triangles = Vec::new();
+        for i in 0..n {
+            let b0 = (2 + i * 2) as u32;
+            let t0 = b0 + 1;
+            let b1 = (2 + ((i + 1) % n) * 2) as u32;
+            let t1 = b1 + 1;
+            triangles.push([b0, b1, t1]);
+            triangles.push([b0, t1, t0]);
+            triangles.push([0, b1, b0]);
+            triangles.push([1, t0, t1]);
+        }
+        let mesh = crate::mesh_body(&positions, &triangles).unwrap();
+        let solid = crate::convert_mesh(&mesh, 0.05).unwrap_or_else(|e| panic!("{e}"));
+        assert!(!solid.is_mesh());
+        let measured = crate::measure(&solid).unwrap();
+        let cones = measured.merged.face_types.get("cone").copied().unwrap_or(0);
+        assert!(cones >= 1, "expected a cone, got {:?}", measured.merged.face_types);
+        let expected = std::f64::consts::PI * h / 3.0 * (r0 * r0 + r0 * r1 + r1 * r1);
+        assert!((measured.volume - expected).abs() / expected < 0.05, "{} vs {expected}", measured.volume);
+    }
+
+    fn stl_body(bytes: &[u8]) -> Body {
+        assert!(bytes.len() >= 84, "not a binary STL");
+        let count = u32::from_le_bytes(bytes[80..84].try_into().unwrap()) as usize;
+        let mut positions = Vec::with_capacity(count.saturating_mul(3));
+        let mut triangles = Vec::with_capacity(count);
+        let mut at = 84usize;
+        for _ in 0..count {
+            at += 12;
+            let base = u32::try_from(positions.len()).unwrap();
+            for _ in 0..3 {
+                let x = f32::from_le_bytes(bytes[at..at + 4].try_into().unwrap()) as f64;
+                let y = f32::from_le_bytes(bytes[at + 4..at + 8].try_into().unwrap()) as f64;
+                let z = f32::from_le_bytes(bytes[at + 8..at + 12].try_into().unwrap()) as f64;
+                positions.push(Vec3::new(x, y, z));
+                at += 12;
+            }
+            at += 2;
+            triangles.push([base, base + 1, base + 2]);
+        }
+        crate::mesh_body(&positions, &triangles).unwrap()
+    }
+
+    #[test]
     fn analytic_box_from_tessellation() {
         let source = crate::box_solid(Vec3::ZERO, Vec3::new(10., 20., 30.)).unwrap();
         let mesh = mesh_of(&source);
@@ -2815,6 +4550,70 @@ mod tests {
         let expected = std::f64::consts::PI * 25. * 12.;
         let v = crate::measure(&converted).unwrap().volume;
         assert!((v - expected).abs() / expected < 0.05, "{v} vs {expected}");
+    }
+
+    /// A half-round is not a tube. Confirm must still sew it as one cylinder, the way the
+    /// convert preview paints it, rather than one face per triangle.
+    #[test]
+    fn analytic_half_cylinder_is_one_cylindrical_face() {
+        let (n, r, h) = (24usize, 10.0_f64, 12.0);
+        let mut positions = Vec::new();
+        for i in 0..=n {
+            let a = PI * i as f64 / n as f64;
+            positions.push(Vec3::new(r * a.cos(), r * a.sin(), 0.));
+        }
+        for i in 0..=n {
+            let a = PI * i as f64 / n as f64;
+            positions.push(Vec3::new(r * a.cos(), r * a.sin(), h));
+        }
+        let b = |i: usize| i as u32;
+        let t = |i: usize| (n + 1 + i) as u32;
+        let mut triangles = Vec::new();
+        for i in 0..n {
+            let (b0, b1, t0, t1) = (b(i), b(i + 1), t(i), t(i + 1));
+            triangles.push([b0, b1, t1]);
+            triangles.push([b0, t1, t0]);
+        }
+        let bc = positions.len() as u32;
+        positions.push(Vec3::ZERO);
+        let tc = positions.len() as u32;
+        positions.push(Vec3::new(0., 0., h));
+        for i in 0..n {
+            triangles.push([bc, b(i + 1), b(i)]);
+            triangles.push([tc, t(i), t(i + 1)]);
+        }
+        // The cut is the plane y = 0, through the two centres. Outward is -Y, and each
+        // edge is the opposite of the cap or wall edge it meets.
+        triangles.push([b(0), t(0), tc]);
+        triangles.push([b(0), tc, bc]);
+        triangles.push([bc, tc, t(n)]);
+        triangles.push([bc, t(n), b(n)]);
+        let mesh_body = crate::mesh_body(&positions, &triangles).expect("half mesh");
+        let expected = 0.5 * PI * r * r * h;
+        let converted = convert_analytic_mesh(&mesh_body, 0.05, 15f64.to_radians()).expect("analytic half cylinder");
+        let measured = crate::measure(&converted).expect("measure");
+        let cyl = measured.merged.face_types.get("cylinder").copied().unwrap_or(0);
+        assert!(cyl >= 1, "expected a cylinder, got {:?}", measured.merged.face_types);
+        assert!((measured.volume - expected).abs() / expected < 0.08, "{} vs {expected} {:?}", measured.volume, measured.merged.face_types);
+        let faces: usize = measured.merged.face_types.values().sum();
+        assert!(faces < 40, "still a triangle mesh: {:?}", measured.merged.face_types);
+    }
+
+    /// The feeder the convert dialog paints as planes and cylinders. Absent on a machine
+    /// without the file, so CI skips it. The committed solid must not be one face per triangle.
+    #[test]
+    fn ball_feeder_import_is_not_the_stl() {
+        let path = r"C:\Users\aidenleefaulconer\Downloads\ball-feeder-to-rod - Copy.stl";
+        let Ok(bytes) = std::fs::read(path) else { return };
+        let mesh = stl_body(&bytes);
+        let triangles = mesh.mesh.as_ref().map(|m| m.triangles.len()).unwrap_or(0);
+        let solid = crate::convert_mesh(&mesh, 0.05).unwrap_or_else(|e| panic!("{e}"));
+        assert!(!solid.is_mesh());
+        let measured = crate::measure(&solid).expect("measure");
+        let faces: usize = measured.merged.face_types.values().sum();
+        eprintln!("ball-feeder tris={triangles} faces={faces} {:?}", measured.merged.face_types);
+        assert!(faces * 4 < triangles.max(1), "still one face per triangle: {faces} from {triangles} {:?}", measured.merged.face_types);
+        assert!(measured.merged.face_types.get("cylinder").copied().unwrap_or(0) >= 1, "{:?}", measured.merged.face_types);
     }
 
     #[test]

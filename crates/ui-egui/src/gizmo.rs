@@ -7,7 +7,7 @@
 use std::cell::RefCell;
 
 use egui::{Color32, Pos2, Rect, Sense, Shape, Stroke, vec2};
-use solidcraft_engine::geom::{Ring, Vec3};
+use solidcraft_engine::geom::{AlignFrame, Ring, Vec3};
 
 use crate::theme::Tokens;
 use crate::viewport::{Proj, projected_polygon};
@@ -343,6 +343,22 @@ pub fn show(ui: &mut egui::Ui, painter: &egui::Painter, proj: &Proj, id: egui::I
         ui.data_mut(|d| d.insert_temp(id, st));
     }
     Some(Drag { handle: st.handle, change, started, done })
+}
+
+/// The three axes of an alignment frame, a fixed size on screen, without drag handles.
+pub fn paint_frame(painter: &egui::Painter, proj: &Proj, frame: &AlignFrame) {
+    let Some(scale) = mm_per_px(proj, frame.origin) else { return };
+    let l = scale * 72.0;
+    let tk = Tokens::get();
+    let origin = frame.origin;
+    for (i, d) in [frame.x, frame.y(), frame.z].into_iter().enumerate() {
+        let Some(a) = proj.to_screen(origin + d * (0.18 * l)) else { continue };
+        let Some(b) = proj.to_screen(origin + d * l) else { continue };
+        arrow(painter, a, b, tk.gizmo[i.min(2)], false);
+    }
+    if let Some(c) = proj.to_screen(origin) {
+        painter.circle(c, 3.5, Color32::from_gray(240), Stroke::new(1.0, Color32::from_gray(40)));
+    }
 }
 
 fn arrow(painter: &egui::Painter, a: Pos2, b: Pos2, col: Color32, hot: bool) {

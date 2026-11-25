@@ -305,7 +305,7 @@ pub fn mesh_import_feature(bytes: &[u8], file: &str) -> Result<MeshFeature> {
     Ok(MeshFeature {
         name,
         body_names: objects.iter().map(|o| o.name.clone()).collect(),
-        kind: solidcraft_doc::FeatureKind::MeshImport { file: file_name, meshes },
+        kind: solidcraft_doc::FeatureKind::MeshImport { file: file_name, meshes, solid: None },
         warnings,
     })
 }

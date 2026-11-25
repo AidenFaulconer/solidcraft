@@ -4,8 +4,8 @@ use std::collections::BTreeSet;
 use std::path::{Path, PathBuf};
 
 use serde_json::{Value, json};
-use solidcraft_doc::FeatureKind;
 use solidcraft_doc::expr::Kind;
+use solidcraft_doc::{Expr, FeatureKind, MeshData, MeshSolid};
 use solidcraft_geom::Vec3;
 
 use super::{
@@ -28,10 +28,13 @@ pub static COMMANDS: &[CommandSpec] = &[
     CommandSpec::new("mesh.convert", "Convert Mesh", convert)
         .icon("import")
         .params("body?: mesh body name (default: the selected mesh body); tolerance?: length expression (default 0.05 mm); angle?: angle expression (default 15 deg: how far a triangle normal may turn while a planar face grows; 2 deg keeps fine faces such as louvers apart); mesh?: percent 1..100 (default 100, share of triangles used to start a fit); cylinders?, cones?, tori?, spheres?, threads?, freeform?: bool (default true). Planes are always fitted. Freeform keeps leftover triangles as facets. Rebuilds a closed mesh as editable faces, with a parametric timeline feature; name?"),
-    CommandSpec::new("mesh.convert_files", "Convert STL Folder", convert_files)
+    CommandSpec::new("mesh.convert_files", "Convert STL", convert_files)
         .icon("import")
         .noundo()
         .params("path?: an .stl file or a folder of them; paths?: more files or folders; output?: a folder, or one .step path when a single STL is converted (default: <name>.step beside each STL); recursive?: bool (default false: only the STL files directly in each folder); tolerance?: length expression (default 0.05 mm; a smaller value, such as 0.02 mm, keeps fine detail); angle?: angle expression (default 15 deg; 2 deg for louvers); mesh?: percent 1..100 (default 100); cylinders?, cones?, tori?, spheres?, threads?, freeform?: bool (default true). Writes one STEP file per STL and does not change the open design → written, failed"),
+    CommandSpec::new("mesh.import", "Import STL", import_stl)
+        .icon("import")
+        .params("path?: an .stl file or a folder of them; paths?: more files or folders; recursive?: bool (default false); origin?: [x, y, z] length expressions (default 0, added in the active component); tolerance?, angle?, mesh?, cylinders?, cones?, tori?, spheres?, threads?, freeform?: the same recognition settings as mesh.convert. Embeds the meshes and rebuilds each as a solid on the timeline; name?"),
 ];
 
 /// The mesh body to convert: `body`, else the one selected body.
@@ -90,7 +93,7 @@ fn convert(s: &mut Session, p: &Value) -> Result<Value> {
 }
 
 /// Convert one mesh body that already belongs to the active component.
-pub(super) fn convert_named(s: &mut Session, cmd: &str, body: &str, name: Option<&str>, choices: &Choices) -> Result<Value> {
+fn convert_named(s: &mut Session, cmd: &str, body: &str, name: Option<&str>, choices: &Choices) -> Result<Value> {
     let state = s.model.state();
     let source = state.body(body).ok_or_else(|| bad(cmd, format!("no body `{body}`")))?;
     if !source.body.is_mesh() {
@@ -172,32 +175,7 @@ fn convert_files(s: &mut Session, p: &Value) -> Result<Value> {
         threads: choices.threads,
         freeform: choices.freeform,
     };
-    let recursive = bool_(p, "recursive").unwrap_or(false);
-    let mut raw = string_list(p, "paths");
-    if let Some(one) = str_(p, "path").filter(|text| !text.trim().is_empty()) {
-        raw.push(one.to_string());
-    }
-    if raw.is_empty() {
-        return Err(bad(cmd, "path or paths is required"));
-    }
-    if raw.len() > MAX_BATCH {
-        return Err(bad(cmd, format!("at most {MAX_BATCH} paths")));
-    }
-    let mut stls = Vec::new();
-    for item in &raw {
-        if item.len() >= 4096 {
-            return Err(bad(cmd, "path is too long"));
-        }
-        collect_stls(Path::new(item), recursive, &mut stls, 0, cmd)?;
-    }
-    stls.sort();
-    stls.dedup();
-    if stls.is_empty() {
-        return Err(bad(cmd, "no STL files"));
-    }
-    if stls.len() > MAX_BATCH {
-        return Err(bad(cmd, format!("at most {MAX_BATCH} STL files")));
-    }
+    let stls = gather_stls(p, cmd)?;
     let output = str_(p, "output").filter(|text| !text.trim().is_empty());
     let alone = stls.len() == 1;
     let mut used = BTreeSet::new();
@@ -219,6 +197,129 @@ fn convert_files(s: &mut Session, p: &Value) -> Result<Value> {
         return Err(bad(cmd, why));
     }
     Ok(json!({"written": written, "failed": failed}))
+}
+
+/// STL paths from `path` and `paths`, files and folders, capped and de-duplicated.
+fn gather_stls(p: &Value, cmd: &str) -> Result<Vec<PathBuf>> {
+    let recursive = bool_(p, "recursive").unwrap_or(false);
+    let mut raw = string_list(p, "paths");
+    if let Some(one) = str_(p, "path").filter(|text| !text.trim().is_empty()) {
+        raw.push(one.to_string());
+    }
+    if raw.is_empty() {
+        return Err(bad(cmd, "choose an STL file or a folder"));
+    }
+    if raw.len() > MAX_BATCH {
+        return Err(bad(cmd, format!("at most {MAX_BATCH} paths")));
+    }
+    let mut stls = Vec::new();
+    for item in &raw {
+        if item.len() >= 4096 {
+            return Err(bad(cmd, "path is too long"));
+        }
+        collect_stls(Path::new(item), recursive, &mut stls, 0, cmd)?;
+    }
+    stls.sort();
+    stls.dedup();
+    if stls.is_empty() {
+        return Err(bad(cmd, "no STL files"));
+    }
+    if stls.len() > MAX_BATCH {
+        return Err(bad(cmd, format!("at most {MAX_BATCH} STL files")));
+    }
+    Ok(stls)
+}
+
+/// Read the STL files into the open design as one timeline feature of solids.
+fn import_stl(s: &mut Session, p: &Value) -> Result<Value> {
+    let cmd = "mesh.import";
+    let choices = choices(s, p, cmd)?;
+    let stls = gather_stls(p, cmd)?;
+    let origin = origin_exprs(s, p, cmd)?;
+    let mut meshes = Vec::with_capacity(stls.len());
+    let mut files = Vec::with_capacity(stls.len());
+    for stl in &stls {
+        meshes.push(stl_mesh(stl, cmd)?);
+        files.push(stl.display().to_string());
+    }
+    let file = files.first().cloned().unwrap_or_else(|| "STL".into());
+    let names: Vec<String> = meshes.iter().map(|m| m.name.clone()).collect();
+    let mut params = json!({
+        "tolerance": choices.tolerance.as_str(),
+        "angle": choices.angle.as_str(),
+        "mesh": choices.mesh,
+        "body_names": names,
+    });
+    if let Some(name) = str_(p, "name").filter(|n| !n.trim().is_empty()) {
+        params["name"] = json!(name);
+    }
+    let solid = MeshSolid {
+        files,
+        tolerance: choices.tolerance,
+        angle: choices.angle,
+        mesh: choices.mesh,
+        cylinders: choices.cylinders,
+        cones: choices.cones,
+        tori: choices.tori,
+        spheres: choices.spheres,
+        threads: choices.threads,
+        freeform: choices.freeform,
+        origin,
+        scad: None,
+    };
+    add_feature(s, &params, FeatureKind::MeshImport { file, meshes, solid: Some(solid) })
+}
+
+fn origin_exprs(s: &Session, p: &Value, cmd: &str) -> Result<[Expr; 3]> {
+    let mut text = ["0 mm".to_string(), "0 mm".to_string(), "0 mm".to_string()];
+    if let Some(raw) = p.get("origin").and_then(Value::as_array) {
+        for (slot, value) in text.iter_mut().zip(raw) {
+            if let Some(n) = value.as_f64() {
+                if !n.is_finite() {
+                    return Err(bad(cmd, "origin must be finite"));
+                }
+                *slot = format!("{n} mm");
+            } else if let Some(expr) = value.as_str().filter(|t| !t.trim().is_empty()) {
+                *slot = expr.to_string();
+            }
+        }
+    }
+    for expr in &text {
+        check_expr(s, expr, Kind::Length, cmd, "origin")?;
+    }
+    Ok([Expr::new(&text[0]), Expr::new(&text[1]), Expr::new(&text[2])])
+}
+
+fn stl_mesh(stl: &Path, cmd: &str) -> Result<MeshData> {
+    let bytes = solidcraft_io::vfs::read(&stl.to_string_lossy(), MAX_STL_BYTES).map_err(|e| bad(cmd, e.to_string()))?;
+    let tris = solidcraft_io::read_stl(&bytes).map_err(|e| bad(cmd, e.to_string()))?;
+    if tris.is_empty() {
+        return Err(bad(cmd, format!("{} has no triangles", stl.display())));
+    }
+    if tris.len() > MAX_BATCH_TRIANGLES {
+        return Err(bad(cmd, format!("the mesh has {} triangles, more than the {MAX_BATCH_TRIANGLES} conversion can take", tris.len())));
+    }
+    let mut positions = Vec::with_capacity(tris.len().saturating_mul(9));
+    let mut triangles = Vec::with_capacity(tris.len().saturating_mul(3));
+    for tri in &tris {
+        let base = u32::try_from(positions.len() / 3).map_err(|_| bad(cmd, "too many vertices"))?;
+        for corner in tri {
+            if !corner.iter().all(|coordinate| coordinate.is_finite()) {
+                return Err(bad(cmd, "STL has a non-finite coordinate"));
+            }
+            positions.extend(corner.iter().map(|c| *c as f64));
+        }
+        triangles.extend([base, base + 1, base + 2]);
+    }
+    let name = stl
+        .file_stem()
+        .map(|n| n.to_string_lossy().into_owned())
+        .filter(|n| !n.is_empty() && !n.contains(['/', '\\', ':']))
+        .unwrap_or_else(|| "Mesh".into());
+    let check_pos: Vec<Vec3> = positions.chunks(3).filter_map(|c| c.get(2).map(|_| Vec3::new(c[0], c[1], c[2]))).collect();
+    let check_tri: Vec<[u32; 3]> = triangles.chunks(3).filter_map(|c| c.get(2).map(|_| [c[0], c[1], c[2]])).collect();
+    solidcraft_kernel::mesh_body(&check_pos, &check_tri).map_err(|e| bad(cmd, e.to_string()))?;
+    Ok(MeshData { name, positions, triangles, color: None })
 }
 
 fn is_stl(path: &Path) -> bool {
@@ -252,10 +353,8 @@ fn collect_stls(path: &Path, recursive: bool, out: &mut Vec<PathBuf>, depth: usi
     }
     names.sort();
     for child in names {
-        if child.is_file() {
-            if is_stl(&child) {
-                out.push(child);
-            }
+        if child.is_file() && is_stl(&child) {
+            out.push(child);
         } else if recursive && child.is_dir() {
             collect_stls(&child, true, out, depth + 1, cmd)?;
         }
@@ -278,11 +377,11 @@ fn step_destination(stl: &Path, output: Option<&str>, alone: bool, cmd: &str) ->
         let ext = ext.to_string_lossy();
         ext.eq_ignore_ascii_case("step") || ext.eq_ignore_ascii_case("stp")
     });
-    if as_file {
-        if !alone {
-            return Err(bad(cmd, "output must be a folder when converting more than one STL"));
-        }
+    if as_file && alone {
         return Ok(dest.to_path_buf());
+    }
+    if as_file {
+        return Err(bad(cmd, "output must be a folder when converting more than one STL"));
     }
     let stem = stl
         .file_stem()

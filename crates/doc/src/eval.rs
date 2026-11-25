@@ -5865,10 +5865,38 @@ fn eval_feature(doc: &Document, vals: &BTreeMap<String, Value>, f: &Feature, st:
             *target = result;
             Ok(())
         }
-        FeatureKind::MeshImport { meshes, .. } => {
-            for (k, (name, b)) in mesh_bodies(meshes)?.into_iter().enumerate() {
+        FeatureKind::MeshImport { meshes, solid, .. } => {
+            let built = mesh_bodies(meshes)?;
+            let Some(solid) = solid else {
+                for (k, (name, b)) in built.into_iter().enumerate() {
+                    let name = copy_body_name(st, f, k, &name);
+                    st.bodies.push(ModelBody::new(name, b, f.id));
+                }
+                return Ok(());
+            };
+            let tolerance = val(vals, &solid.tolerance, Kind::Length)?;
+            let angle = val(vals, &solid.angle, Kind::Angle)?;
+            let origin = Vec3::new(
+                val(vals, &solid.origin[0], Kind::Length)?,
+                val(vals, &solid.origin[1], Kind::Length)?,
+                val(vals, &solid.origin[2], Kind::Length)?,
+            );
+            let options = kernel::ConvertOptions {
+                tolerance,
+                angle,
+                mesh_percent: solid.mesh,
+                cylinders: solid.cylinders,
+                cones: solid.cones,
+                tori: solid.tori,
+                spheres: solid.spheres,
+                threads: solid.threads,
+                freeform: solid.freeform,
+            };
+            for (k, (name, body)) in built.into_iter().enumerate() {
+                let converted = kernel::convert_mesh_with(&body, &options)?.with_color(body.color());
+                let placed = kernel::transform(&converted, origin, Vec3::ZERO, Vec3::Z, 0.0)?;
                 let name = copy_body_name(st, f, k, &name);
-                st.bodies.push(ModelBody::new(name, b, f.id));
+                st.bodies.push(ModelBody::new(name, placed, f.id));
             }
             Ok(())
         }

@@ -10,6 +10,7 @@
 #![forbid(unsafe_code)]
 
 mod aabb2;
+mod align_frame;
 mod arcfit;
 pub mod blend;
 pub mod brep;
@@ -34,6 +35,7 @@ mod unit_vec3;
 mod vec;
 
 pub use aabb2::Aabb2;
+pub use align_frame::{AlignFrame, Inferred, Placement, Screen, circle_through, on_edge, on_face};
 pub use arcfit::MAX_FIT_PIECES;
 pub use blend::hermite_bezier;
 pub use bvh::{Bvh, MeshIndex};

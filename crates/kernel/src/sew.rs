@@ -772,6 +772,22 @@ fn split_vertex_fans(faces: Vec<mt::Face>) -> Result<Vec<mt::Face>> {
         .collect()
 }
 
+/// Remove edges whose ends weld into one vertex. Sew refuses those
+/// (`sew: a degenerate edge`): a zero-length edge makes the kernel panic.
+/// A loop left with fewer than three edges is dropped, and so is a face with none.
+pub(crate) fn drop_degenerate_edges(faces: &mut Vec<FaceSpec>) {
+    for face in faces.iter_mut() {
+        for loop_ in &mut face.loops {
+            loop_.retain(|edge| {
+                let (a, b) = edge.ends();
+                a.is_finite() && b.is_finite() && a.dist(b) >= 1e-9 && key(a) != key(b)
+            });
+        }
+        face.loops.retain(|loop_| loop_.len() >= 3);
+    }
+    faces.retain(|face| !face.loops.is_empty());
+}
+
 fn sew_impl(faces: &[FaceSpec], touching: bool, sources: Option<&[Option<crate::FaceSource>]>) -> Result<(Body, Option<Vec<usize>>)> {
     if faces.len() < 4 || faces.len() > 200_000 {
         return Err(KernelError::Invalid("a solid needs 4…200000 faces".into()));
@@ -826,7 +842,12 @@ fn sew_impl(faces: &[FaceSpec], touching: bool, sources: Option<&[Option<crate::
                     Ok(face) => face,
                     // truck's fit loses thin faces away from the origin: see `plane_about_the_mean`.
                     Err(e) => {
-                        let plane = plane_about_the_mean(&wires).ok_or_else(|| KernelError::Failed(format!("sew: face {fi}: {e}")))?;
+                        // `try_attach_plane` gives up when a corner is a fraction of a micrometre
+                        // off. A convert tolerance of a few hundredths of a millimetre is still a
+                        // plane; fit one and keep the shared edges.
+                        let plane = plane_about_the_mean(&wires)
+                            .or_else(|| fitted_plane(&wires))
+                            .ok_or_else(|| KernelError::Failed(format!("sew: face {fi}: {e}")))?;
                         mt::Face::try_new(wires, mt::Surface::Plane(plane)).map_err(|e| KernelError::Failed(format!("sew: face {fi}: {e}")))?
                     }
                 },
@@ -953,6 +974,41 @@ fn curved(mut surf: mt::Surface, wires: Vec<mt::Wire>, probe: Option<(Vec3, Vec3
 /// normal is short, turns the normal far enough for truck's own flatness test to fail: truck
 /// finds a 0.00013 x 30 mm face 360 mm from the origin 2e-6 mm out of the plane it fitted. With
 /// the centre at the origin the same face is 1e-14 mm out at most.
+/// A plane through the wire's mean, from its area normal. Used when truck will not
+/// accept a wire that is still within a millimetre of flat.
+fn fitted_plane(wires: &[mt::Wire]) -> Option<mt::Plane> {
+    let mut pts = Vec::new();
+    for p in wires.iter().flat_map(|w| w.edge_iter()).flat_map(|e| e.oriented_curve().lift_up().control_points().clone()) {
+        let q = Vec3::new(p.x / p.w, p.y / p.w, p.z / p.w);
+        if q.is_finite() {
+            pts.push(q);
+        }
+    }
+    if pts.len() < 3 {
+        return None;
+    }
+    let c = pts.iter().fold(Vec3::ZERO, |sum, p| sum + *p) * (1.0 / pts.len() as f64);
+    let mut n = Vec3::ZERO;
+    for pair in pts.windows(2) {
+        let (Some(a), Some(b)) = (pair.first(), pair.get(1)) else { continue };
+        n += (*a - c).cross(*b - c);
+    }
+    if let (Some(a), Some(b)) = (pts.first(), pts.last()) {
+        n += (*b - c).cross(*a - c);
+    }
+    let n = n.normalized()?;
+    let d = c.dot(n);
+    let dev = pts.iter().fold(0.0_f64, |max, p| max.max((p.dot(n) - d).abs()));
+    // Dialog tolerance is at most 1 mm, and a convert plane is accepted at 0.05 mm.
+    // Anything further off is not a plane to force through.
+    if dev > 0.05 {
+        return None;
+    }
+    let u = n.any_perp();
+    let v = n.cross(u);
+    Some(mt::Plane::new(p3(c), p3(c + u), p3(c + v)))
+}
+
 fn plane_about_the_mean(wires: &[mt::Wire]) -> Option<mt::Plane> {
     let (mut sum, mut count) = (Vec3::ZERO, 0usize);
     for p in wires.iter().flat_map(|w| w.edge_iter()).flat_map(|e| e.oriented_curve().lift_up().control_points().clone()) {

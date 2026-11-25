@@ -226,11 +226,19 @@ crate::dialog_descriptor::dialog_descriptors! {
                 /// Keep triangles that are not an analytic face, as facets.
                 freeform: bool,
             },
-            /// STL files on disk, one STEP file each. The open design is unchanged.
+            /// STL files. `into_design` rebuilds them as solids in the open design; otherwise
+            /// each one is written to its own STEP file and the design is left unchanged.
             MeshConvertFiles {
                 path: String,
+                /// More STL files or folders, besides `path`.
+                paths: Vec<String>,
                 output: String,
                 recursive: bool,
+                /// Place the solids in the open design instead of writing STEP files.
+                into_design: bool,
+                origin_x: String,
+                origin_y: String,
+                origin_z: String,
                 tolerance: String,
                 angle: String,
                 mesh: String,
@@ -316,7 +324,9 @@ crate::dialog_descriptor::dialog_descriptors! {
             },
             /// Move bodies by a distance along X, Y and Z.
             /// Move/Copy (see `dialogs_move`): the move type, X/Y/Z distances (Point to Position: the
-            /// target), X/Y/Z angles (Free Move) and the angle (Rotate).
+            /// target), X/Y/Z angles (Free Move) and the angle (Rotate). Align Frames keeps a local
+            /// offset, a turn and a primary-axis flip for each frame; the strings stay on the dialog
+            /// so their text fields keep a stable identity.
             Move {
                 mode: usize,
                 x: String,
@@ -326,6 +336,16 @@ crate::dialog_descriptor::dialog_descriptors! {
                 ry: String,
                 rz: String,
                 angle: String,
+                from_x: String,
+                from_y: String,
+                from_z: String,
+                from_turn: String,
+                from_flip: bool,
+                to_x: String,
+                to_y: String,
+                to_z: String,
+                to_turn: String,
+                to_flip: bool,
             },
             Hole {
                 diameter: String,
@@ -658,11 +678,16 @@ impl Dialog {
                 },
                 vec![SelInput::new("Mesh body", BODIES, false)],
             ),
-            "mesh.convert_files" => Dialog::new(
+            "mesh.convert_files" | "mesh.import" => Dialog::new(
                 Kind::MeshConvertFiles {
                     path: String::new(),
+                    paths: Vec::new(),
                     output: String::new(),
                     recursive: false,
+                    into_design: id == "mesh.import",
+                    origin_x: "0 mm".into(),
+                    origin_y: "0 mm".into(),
+                    origin_z: "0 mm".into(),
                     tolerance: "0.05 mm".into(),
                     angle: "15 deg".into(),
                     mesh: "100 %".into(),
@@ -673,7 +698,7 @@ impl Dialog {
                     threads: true,
                     freeform: true,
                 },
-                Vec::new(),
+                vec![SelInput::new("Origin", selection::VERTICES | selection::EDGES | selection::FACES | selection::ORIGIN, false)],
             ),
             "construct.plane.midplane" => Dialog::new(
                 Kind::Midplane,
@@ -933,6 +958,8 @@ impl Dialog {
             Kind::Part(_) | Kind::PartSize(_) => return true,
             // Web previews run synchronously; a modelled thread can take seconds.
             Kind::Thread { .. } => return !cfg!(target_arch = "wasm32") && self.extra.get("modeled").and_then(Value::as_bool).unwrap_or(false),
+            // Face-group colours, until confirm. Writing STEP files does not preview in the view.
+            Kind::MeshConvertFiles { into_design, .. } => return *into_design,
             _ => {}
         }
         matches!(
@@ -993,7 +1020,9 @@ impl Dialog {
             // translate, the angle for Rotate. Point to Point is two picks with nothing to type.
             Kind::Move { mode, x, angle, .. } => match *mode {
                 crate::dialogs_move::ROTATE => ("Angle", ValueKind::Angle, angle),
-                crate::dialogs_move::POINT_TO_POINT => return None,
+                // Point to Point and Align Frames are picks. A frame's offset and turn live in
+                // the dialog, beside the frame, once it has been picked.
+                crate::dialogs_move::POINT_TO_POINT | crate::dialogs_move::ALIGN => return None,
                 _ => ("X", ValueKind::Length, x),
             },
             Kind::PatternRect { spacing, .. } => ("Spacing", ValueKind::Length, spacing),
@@ -1619,7 +1648,7 @@ fn title(k: &Kind) -> &'static str {
         Kind::Material { .. } => "PHYSICAL MATERIAL",
         Kind::Midplane => "MIDPLANE",
         Kind::MeshConvert { .. } => "CONVERT MESH",
-        Kind::MeshConvertFiles { .. } => "CONVERT STL FOLDER",
+        Kind::MeshConvertFiles { .. } => "CONVERT STL",
         Kind::Construct { title, .. } => title,
         Kind::PathPlane { .. } => "PLANE ALONG PATH",
         Kind::Rib { web: false, .. } => "RIB",
@@ -1860,6 +1889,10 @@ fn selection_label(s: &Session, item: &Sel) -> String {
 /// Selection input rows: label, "N selected" (or a hint) and a clear button; clicking a row
 /// makes it the active input.
 fn input_rows(d: &mut Dialog, ui: &mut egui::Ui, s: &Session) {
+    // The origin pick belongs to placing solids in this design, not to writing STEP files.
+    if matches!(&d.kind, Kind::MeshConvertFiles { into_design: false, .. }) {
+        return;
+    }
     input_rows_range(d, ui, s, 0..d.inputs.len());
 }
 
@@ -1968,6 +2001,7 @@ fn input_rows_range(d: &mut Dialog, ui: &mut egui::Ui, s: &Session, range: std::
         if let Some(key) = feature_pattern_reference_key(d, i) {
             d.extra.remove(key);
         }
+        crate::dialogs_move::forget_frame(d, i);
         let Some(inp) = d.inputs.get_mut(i) else { return };
         inp.items.clear();
         if i == 0 {
@@ -2366,10 +2400,14 @@ pub fn show(app: &mut SolveApp, ctx: &egui::Context) {
                 if cell_enter {
                     ui.input_mut(|i| i.consume_key(egui::Modifiers::NONE, egui::Key::Enter));
                 }
-                let text = app.applying.as_ref().map(|job| {
+                let text = if let Some(job) = app.applying.as_ref() {
                     let seconds = ((crate::now_ms() - job.started) / 1000.0).floor().max(0.0);
-                    crate::i18n::format("dialog.computing", &[("seconds", &format!("{seconds:.0}"))])
-                });
+                    Some(crate::i18n::format("dialog.computing", &[("seconds", &format!("{seconds:.0}"))]))
+                } else if app.preview.busy && matches!(d.kind, Kind::MeshConvertFiles { into_design: true, .. }) {
+                    Some("Fitting face groups…".into())
+                } else {
+                    None
+                };
                 crate::ui_kit::ComputeStatus { text, busy: app.applying.is_some() || app.preview.busy, applying: app.applying.is_some() }
             };
             let (closed, action) = if manager {
@@ -2451,7 +2489,29 @@ pub fn show(app: &mut SolveApp, ctx: &egui::Context) {
             Err(error) => d.refuse(app, error),
         }
     }
-    if ok && app.applying.is_none() {
+    if ok && app.applying.is_none() && crate::import_jobs::wants(&d) {
+        // An edit is rolled back to the feature. Put the marker back before the worker
+        // copies the design, then queue the command that was built for that feature.
+        match apply_commands(app, &d) {
+            Err(error) => d.refuse(app, error),
+            Ok(commands) => {
+                let restored = match d.editing {
+                    Some((_, marker)) => roll_marker(app, marker),
+                    None => Ok(()),
+                };
+                match restored {
+                    Err(error) => d.refuse(app, error),
+                    Ok(()) => {
+                        d.editing = None;
+                        match crate::import_jobs::enqueue_commands(app, commands) {
+                            Ok(()) => cancel = true,
+                            Err(error) => d.refuse(app, error),
+                        }
+                    }
+                }
+            }
+        }
+    } else if ok && app.applying.is_none() {
         d.repeat_after_apply = apply_again;
         // Edit Text applies its own way: its live changes and OK are one undo step.
         let run = match &mut d.kind {
@@ -2860,6 +2920,14 @@ pub(crate) fn facing(app: &SolveApp, n: Vec3, again: bool) -> Vec3 {
     if again && app.cam.back().dot(n) > 0.999 { -n } else { n }
 }
 
+/// A vertex, a point on an edge, or a point on a face chosen as an import origin.
+fn picked_origin(d: &Dialog) -> Option<Vec3> {
+    match d.inputs.first().and_then(|input| input.items.first()) {
+        Some(Sel::Vertex { point, .. } | Sel::Edge { point, .. } | Sel::Face { point, .. }) => Some(*point),
+        _ => None,
+    }
+}
+
 fn sels(d: &Dialog, i: usize) -> &[Sel] {
     selection::items(&d.inputs, i)
 }
@@ -2922,6 +2990,13 @@ pub(crate) fn report_title(d: &Dialog) -> String {
 pub fn apply_commands(app: &SolveApp, d: &Dialog) -> Result<Vec<(String, Value)>, String> {
     let cmds = dialog_commands(app, d)?;
     if let Some((id, _)) = d.editing {
+        if matches!(d.kind, Kind::Scad(_)) {
+            let mut params = cmds.into_iter().next().map(|(_, params)| params).ok_or("nothing to apply")?;
+            if let Value::Object(map) = &mut params {
+                map.insert("feature".into(), json!(id));
+            }
+            return Ok(vec![("scad.revise".into(), params)]);
+        }
         let (cmd, mut params) = cmds.into_iter().next().ok_or("nothing to apply")?;
         if let Some(feature) = app.session.doc.feature(id) {
             let original_all = match &feature.kind {
@@ -3299,16 +3374,55 @@ fn dialog_commands(app: &SolveApp, d: &Dialog) -> Result<Vec<(String, Value)>, S
                 json!({"body": body, "tolerance": tolerance, "angle": angle, "mesh": mesh, "cylinders": cylinders, "cones": cones, "tori": tori, "spheres": spheres, "threads": threads, "freeform": freeform}),
             )
         }
-        Kind::MeshConvertFiles { path, output, recursive, tolerance, angle, mesh, cylinders, cones, tori, spheres, threads, freeform } => {
-            if path.trim().is_empty() {
+        Kind::MeshConvertFiles {
+            path,
+            paths,
+            output,
+            recursive,
+            into_design,
+            origin_x,
+            origin_y,
+            origin_z,
+            tolerance,
+            angle,
+            mesh,
+            cylinders,
+            cones,
+            tori,
+            spheres,
+            threads,
+            freeform,
+        } => {
+            if path.trim().is_empty() && paths.is_empty() {
                 return Err("choose an STL file or a folder".into());
             }
             let mesh = mesh_percent(mesh)?;
-            let mut params = json!({"path": path, "recursive": recursive, "tolerance": tolerance, "angle": angle, "mesh": mesh, "cylinders": cylinders, "cones": cones, "tori": tori, "spheres": spheres, "threads": threads, "freeform": freeform});
-            if !output.trim().is_empty() {
-                params["output"] = json!(output);
+            let mut listed = paths.clone();
+            if !path.trim().is_empty() {
+                listed.insert(0, path.clone());
             }
-            ("mesh.convert_files", params)
+            let origin = if *into_design {
+                if let Some(point) = picked_origin(d) {
+                    json!([format!("{:.6} mm", point.x), format!("{:.6} mm", point.y), format!("{:.6} mm", point.z)])
+                } else {
+                    json!([origin_x, origin_y, origin_z])
+                }
+            } else {
+                Value::Null
+            };
+            let mut params = json!({"paths": listed, "recursive": recursive, "tolerance": tolerance, "angle": angle, "mesh": mesh, "cylinders": cylinders, "cones": cones, "tori": tori, "spheres": spheres, "threads": threads, "freeform": freeform});
+            if *into_design {
+                params["origin"] = origin;
+                ("mesh.import", params)
+            } else {
+                if !output.trim().is_empty() {
+                    params["output"] = json!(output);
+                }
+                if let Some(first) = listed.first() {
+                    params["path"] = json!(first);
+                }
+                ("mesh.convert_files", params)
+            }
         }
         Kind::Midplane => {
             need(0, "the first plane")?;
@@ -4764,6 +4878,38 @@ pub fn for_feature(app: &SolveApp, id: u64, marker: Option<usize>) -> Option<Dia
             if let Some(inp) = d.inputs.first_mut() {
                 inp.items = bodies.iter().map(|n| Sel::Body { name: n.to_string() }).collect();
             }
+            d
+        }
+        FeatureKind::MeshImport { solid: Some(solid), .. } if crate::dialogs_scad::is_open_scad(solid) => {
+            let mut d = start("scad.insert")?;
+            if let Kind::Scad(k) = &mut d.kind {
+                crate::dialogs_scad::from_feature(k, solid, &f.name);
+            }
+            d
+        }
+        FeatureKind::MeshImport { solid: Some(solid), file, .. } => {
+            let mut d = start("mesh.convert_files")?;
+            let mut files = solid.files.clone();
+            let path = if files.is_empty() { file.clone() } else { files.remove(0) };
+            d.kind = Kind::MeshConvertFiles {
+                path,
+                paths: files,
+                output: String::new(),
+                recursive: false,
+                into_design: true,
+                origin_x: solid.origin[0].as_str().to_string(),
+                origin_y: solid.origin[1].as_str().to_string(),
+                origin_z: solid.origin[2].as_str().to_string(),
+                tolerance: solid.tolerance.as_str().to_string(),
+                angle: solid.angle.as_str().to_string(),
+                mesh: format!("{} %", solid.mesh),
+                cylinders: solid.cylinders,
+                cones: solid.cones,
+                tori: solid.tori,
+                spheres: solid.spheres,
+                threads: solid.threads,
+                freeform: solid.freeform,
+            };
             d
         }
         FeatureKind::Move { bodies, translate, rotate_axis, angle, copy } => {

@@ -653,9 +653,69 @@ fn additional_rows(app: &mut SolveApp, d: &mut Dialog, ui: &mut egui::Ui) -> boo
             form_row(ui, "Mesh", |ui| enter |= field(ui, mesh));
             recognition_rows(ui, cylinders, cones, tori, spheres, threads, freeform);
         }
-        Kind::MeshConvertFiles { path, output, recursive, tolerance, angle, mesh, cylinders, cones, tori, spheres, threads, freeform } => {
+        Kind::MeshConvertFiles {
+            path,
+            paths,
+            output,
+            recursive,
+            into_design,
+            origin_x,
+            origin_y,
+            origin_z,
+            tolerance,
+            angle,
+            mesh,
+            cylinders,
+            cones,
+            tori,
+            spheres,
+            threads,
+            freeform,
+        } => {
+            form_row(ui, "Place", |ui| {
+                let mut place = usize::from(*into_design);
+                if ui_kit::segmented(ui, &mut place, &["STEP file", "This design"], Default::default()) {
+                    *into_design = place == 1;
+                }
+            });
+            if *into_design {
+                if d.inputs.is_empty() {
+                    d.inputs.push(crate::selection::SelInput::new(
+                        "Origin",
+                        crate::selection::VERTICES | crate::selection::EDGES | crate::selection::FACES | crate::selection::ORIGIN,
+                        false,
+                    ));
+                }
+            } else {
+                d.inputs.clear();
+            }
             form_row(ui, "Folder", |ui| enter |= field(ui, path));
-            form_row(ui, "Output", |ui| enter |= field(ui, output));
+            if ui_kit::button(ui, "Add STL", ui_kit::Button::Normal).clicked() {
+                app.pick_open_for(&["stl"], |app, picked| {
+                    let Some(picked) = picked else { return };
+                    let Some(dialog) = app.dialog.as_mut() else { return };
+                    if let Kind::MeshConvertFiles { paths, .. } = &mut dialog.kind
+                        && !paths.iter().any(|have| have == &picked)
+                    {
+                        paths.push(picked);
+                    }
+                });
+            }
+            for (index, extra) in paths.iter().enumerate() {
+                ui_kit::text(ui, extra, ui_kit::Text::Note(&format!("stl_extra_{index}")));
+            }
+            if !*into_design {
+                form_row(ui, "Output", |ui| enter |= field(ui, output));
+            } else {
+                form_row(ui, "Origin X", |ui| enter |= field(ui, origin_x));
+                form_row(ui, "Origin Y", |ui| enter |= field(ui, origin_y));
+                form_row(ui, "Origin Z", |ui| enter |= field(ui, origin_z));
+                ui_kit::text(
+                    ui,
+                    "Pick a vertex, a point on an edge, or a point on a face. That point is the origin; 0, 0, 0 keeps each file's own coordinates. Confirm queues the conversion and closes this dialog, so another STL can be queued while this one runs. Edit the timeline feature to change the fit.",
+                    ui_kit::Text::Note("stl_place"),
+                );
+            }
             form_row(ui, "Tolerance", |ui| enter |= field(ui, tolerance));
             form_row(ui, "Angle", |ui| enter |= field(ui, angle));
             form_row(ui, "Mesh", |ui| enter |= field(ui, mesh));
@@ -673,6 +733,7 @@ fn additional_rows(app: &mut SolveApp, d: &mut Dialog, ui: &mut egui::Ui) -> boo
                     ],
                     2,
                 );
+                group_key(ui);
                 recognition_note(ui);
             });
         }
@@ -773,8 +834,8 @@ fn additional_rows(app: &mut SolveApp, d: &mut Dialog, ui: &mut egui::Ui) -> boo
                 choice_row(ui, "Operation", "sw_op", operation, &OP_LABELS);
             });
         }
-        k @ Kind::Move { .. } => {
-            enter |= crate::dialogs_move::rows(ui, k);
+        Kind::Move { .. } => {
+            enter |= crate::dialogs_move::rows(ui, d);
             extra_options(ui, "move_options", &mut d.extra, &[("Create Copy", "copy")]);
         }
         Kind::Primitive { fields, operation, at, .. } => {
@@ -846,10 +907,27 @@ fn recognition_rows(
     });
 }
 
+fn group_key(ui: &mut egui::Ui) {
+    let rows = [
+        ([70, 130, 210], "Plane"),
+        ([40, 190, 180], "Cylinder"),
+        ([230, 200, 50], "Sphere"),
+        ([220, 90, 160], "Freeform"),
+        ([140, 90, 70], "Left out"),
+    ];
+    ui.horizontal_wrapped(|ui| {
+        for (rgb, label) in rows {
+            let (rect, _) = ui.allocate_exact_size(egui::vec2(12.0, 12.0), egui::Sense::hover());
+            ui.painter().rect_filled(rect, 2.0, egui::Color32::from_rgb(rgb[0], rgb[1], rgb[2]));
+            ui.label(label);
+        }
+    });
+}
+
 fn recognition_note(ui: &mut egui::Ui) {
     ui.add(
         egui::Label::new(
-            "Planes are always fitted. Angle is how far a triangle normal may turn while a face grows; 2 deg keeps fine louvers apart. Cones, tori and threads stay with those faces until a fitter for them exists. Freeform keeps whatever is left as facets.",
+            "Planes are always fitted. Angle is how far a triangle normal may turn while a face grows; 2 deg keeps fine louvers apart. A cone is a ring whose radius changes steadily along its axis. Tori and threads stay with the other faces until a fitter for them exists. Freeform keeps whatever is left as facets.",
         )
         .wrap(),
     );

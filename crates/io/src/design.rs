@@ -921,7 +921,7 @@ mod tests {
         let mut other = mesh();
         other.name = "Same triangles, separate appearance".into();
         other.color = None;
-        doc.add_feature(FeatureKind::MeshImport { file: "example.obj".into(), meshes: vec![mesh(), other] }, None).unwrap();
+        doc.add_feature(FeatureKind::MeshImport { file: "example.obj".into(), meshes: vec![mesh(), other], solid: None }, None).unwrap();
         doc.canvases.push(solidcraft_doc::canvas::Canvas {
             id: 99,
             name: "Reference".into(),
@@ -1253,7 +1253,7 @@ mod tests {
         let mut large = mesh();
         large.positions = (0..300_000).map(|i| (i as f64 * 0.001234567890123).sin() * 100.0).collect();
         large.triangles = (0..300_000).map(|i| (i % 100_000) as u32).collect();
-        doc.add_feature(FeatureKind::MeshImport { file: "generated.obj".into(), meshes: vec![large] }, None).unwrap();
+        doc.add_feature(FeatureKind::MeshImport { file: "generated.obj".into(), meshes: vec![large], solid: None }, None).unwrap();
         measure_storage(&doc, "mesh");
     }
 

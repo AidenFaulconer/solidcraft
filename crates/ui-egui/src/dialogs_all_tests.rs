@@ -191,7 +191,7 @@ fn control_role(command: &str, label: &str) -> Option<egui::accesskit::Role> {
     use egui::accesskit::Role;
     Some(match label {
         "Type" if matches!(command, "sheet.flange" | "sheet.hem" | "solid.revolve" | "solid.emboss") => return None,
-        "Direction" => return None, // segmented buttons, labelled by each choice
+        "Direction" | "Place" => return None, // segmented buttons, labelled by each choice
         "Continuity" | "Corners" | "Cells" | "Profile" => return None,
         "Operation" if command == "solid.mirror" => return None,
         "Operation" | "Type" | "Orientation" | "Move Type" | "Object Type" | "Rule" | "Rim Edge" | "Catch Direction" | "Shape" | "Holes" | "Size"
@@ -220,7 +220,7 @@ form_case!(sweep, "solid.sweep", ["Orientation"]);
 form_case!(offset_plane, "construct.plane.offset", ["Distance"]);
 form_case!(midplane, "construct.plane.midplane", []);
 form_case!(mesh_convert, "mesh.convert", ["Tolerance", "Angle", "Mesh"]);
-form_case!(mesh_convert_files, "mesh.convert_files", ["Folder", "Output", "Tolerance", "Angle", "Mesh"]);
+form_case!(mesh_convert_files, "mesh.convert_files", ["Place", "Folder", "Output", "Tolerance", "Angle", "Mesh"]);
 form_case!(axis_two_planes, "construct.axis.two_planes", []);
 form_case!(point_along_path, "construct.point.along_path", ["Position (0 to 1)"]);
 form_case!(angle_plane, "construct.plane.at_angle", ["Angle"]);

@@ -1811,7 +1811,11 @@ pub(crate) fn dialog_pick(app: &mut SolveApp, hit: &Hit, sel: Sel) {
         return;
     }
     let Some(mut d) = app.dialog.take() else { return };
+    let slot = d.active;
     d.pick(&app.session, sel);
+    let proj = display_proj(app);
+    let cursor = app.viewport.mouse.or_else(|| crate::dialogs_move::hit_point(hit).and_then(|p| proj.to_screen(p)));
+    crate::dialogs_move::capture(&app.session, &mut d, slot, hit, &proj, cursor);
     if let crate::dialogs::Kind::PathPlane { sketch, .. } = &mut d.kind {
         *sketch = match hit {
             Hit::SketchCurve { sketch, .. } => Some(*sketch),

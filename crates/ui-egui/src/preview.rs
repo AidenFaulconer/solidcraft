@@ -387,6 +387,18 @@ fn spawn(pv: &mut PreviewState, key: u64, scratch: Session, cmds: Vec<(String, V
 /// show their result in place of the bodies they change. When the feature fails (a boolean the
 /// kernel can't do yet), the tool body is still shown, with the error.
 pub fn compute(s: &Session, cmds: &[(String, Value)], colors: Colors) -> Job {
+    if let Some(groups) = crate::mesh_groups::build(s, cmds) {
+        return groups.map(|groups| Built {
+            scene: groups.scene,
+            sketches: Vec::new(),
+            replaced: Vec::new(),
+            error: None,
+            bounds: groups.bounds,
+            applied: None,
+            tapered: Vec::new(),
+            stopped: None,
+        });
+    }
     if cmds.iter().any(|(command, params)| {
         matches!(
             command.as_str(),

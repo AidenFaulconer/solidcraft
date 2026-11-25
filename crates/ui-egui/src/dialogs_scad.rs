@@ -1,6 +1,7 @@
 //! OpenSCAD library: choose a `.scad` file, edit the parameters written at the top of it,
-//! and insert the mesh OpenSCAD makes. The script stays a file on disk. The design stores
-//! the mesh, not a live link back to the script.
+//! and insert the solid OpenSCAD's mesh is rebuilt into. The feature remembers the script
+//! and the values used. Double-clicking it in the timeline opens this dialog again, and
+//! OK runs OpenSCAD and rebuilds that same solid.
 
 use crate::ui_kit::{self, choice_row, text_row};
 use serde_json::{Map, Value, json};
@@ -44,8 +45,17 @@ pub struct Dlg {
     pub name: String,
     /// `$fn`, empty when the script's own value should stand.
     pub fn_text: String,
+    /// Curve settings the dialog does not show, kept so an edit sends them again.
+    pub fa: Option<f64>,
+    pub fs: Option<f64>,
     pub note: String,
     pub truncated: bool,
+    /// Script this dialog was opened from. Empty for a new insert.
+    pub pending_path: String,
+    /// Values saved on the feature. Applied once the library listing has the script.
+    pub overrides: Map<String, Value>,
+    /// The saved script has already been looked up, so typing in Library does not scan.
+    pub prepared: bool,
 }
 
 impl Default for Dlg {
@@ -59,14 +69,53 @@ impl Default for Dlg {
             found: String::new(),
             name: String::new(),
             fn_text: String::new(),
+            fa: None,
+            fs: None,
             note: String::new(),
             truncated: false,
+            pending_path: String::new(),
+            overrides: Map::new(),
+            prepared: false,
         }
     }
 }
 
 pub fn start(id: &str) -> Option<(Kind, Vec<crate::selection::SelInput>)> {
     (id == "scad.insert").then(|| (Kind::Scad(Dlg::default()), Vec::new()))
+}
+
+/// An import that should reopen this dialog rather than the STL converter.
+pub fn is_open_scad(solid: &solidcraft_engine::doc::MeshSolid) -> bool {
+    solid.scad.is_some() || solid.files.iter().any(|path| path.to_ascii_lowercase().ends_with(".scad"))
+}
+
+/// Fill the dialog from a timeline feature. The library listing happens when the dialog draws.
+pub fn from_feature(k: &mut Dlg, solid: &solidcraft_engine::doc::MeshSolid, feature_name: &str) {
+    let path = solid
+        .scad
+        .as_ref()
+        .map(|source| source.path.clone())
+        .or_else(|| solid.files.iter().find(|path| path.to_ascii_lowercase().ends_with(".scad")).cloned())
+        .unwrap_or_default();
+    k.pending_path.clone_from(&path);
+    k.dir = parent_of(&path);
+    k.name = feature_name.to_string();
+    k.prepared = false;
+    let Some(source) = &solid.scad else { return };
+    k.overrides.clone_from(&source.parameters);
+    if let Some(program) = &source.openscad {
+        k.openscad.clone_from(program);
+    }
+    if let Some(n) = source.segments {
+        k.fn_text = n.to_string();
+    }
+    k.fa = source.fa;
+    k.fs = source.fs;
+}
+
+fn parent_of(path: &str) -> String {
+    let parent = std::path::Path::new(path).parent().map(|p| p.to_string_lossy().into_owned()).unwrap_or_default();
+    if parent.is_empty() || parent == "." { String::new() } else { parent }
 }
 
 struct Loaded {
@@ -151,6 +200,7 @@ fn matches_filter(name: &str, filter: &str) -> bool {
 
 /// The dialog's rows. Enter in a text field confirms.
 pub fn rows(app: &mut SolveApp, ui: &mut egui::Ui, k: &mut Dlg) -> bool {
+    prepare(app, k);
     let mut enter = false;
     let (_changed, submitted) = text_row(ui, "Library", &mut k.dir, "folder or .scad file");
     enter |= submitted;
@@ -159,6 +209,7 @@ pub fn rows(app: &mut SolveApp, ui: &mut egui::Ui, k: &mut Dlg) -> bool {
             let dir = k.dir.clone();
             let loaded = load(app, &dir);
             apply_load(k, loaded);
+            restore_script(k);
         }
         if ui_kit::button(ui, "Browse", ui_kit::Button::Normal).clicked() {
             app.pick_open_for(&["scad"], |app, path| {
@@ -166,12 +217,13 @@ pub fn rows(app: &mut SolveApp, ui: &mut egui::Ui, k: &mut Dlg) -> bool {
                 let loaded = load(app, &path);
                 let Some(k) = dialog(app) else { return };
                 apply_load(k, loaded);
+                restore_script(k);
             });
         }
     });
-    if k.found.is_empty() {
+    if k.found.is_empty() && k.openscad.trim().is_empty() {
         ui_kit::text(ui, "OpenSCAD was not found on PATH. Install it, or set the program path.", ui_kit::Text::Note("scad_missing"));
-    } else if k.openscad.trim().is_empty() {
+    } else if k.openscad.trim().is_empty() && !k.found.is_empty() {
         ui_kit::text(ui, &format!("Using {}", k.found), ui_kit::Text::Note("scad_found"));
     }
     let (_, submitted) = text_row(ui, "Program", &mut k.openscad, "openscad.exe, if it is not on PATH");
@@ -218,11 +270,12 @@ pub fn rows(app: &mut SolveApp, ui: &mut egui::Ui, k: &mut Dlg) -> bool {
     enter |= submitted;
     let (_, submitted) = text_row(ui, "Name", &mut k.name, "component name");
     enter |= submitted;
-    ui_kit::text(
-        ui,
-        "OK runs OpenSCAD and inserts a mesh in the active component. Changing these values later does not rebuild that mesh.",
-        ui_kit::Text::Note("scad_mesh"),
-    );
+    let note = if k.pending_path.is_empty() {
+        "OK runs OpenSCAD and inserts an editable solid in the active component. Faces highlight, and sketch, extrude and fillet apply. Double-click the feature in the timeline to change these values and rebuild it."
+    } else {
+        "OK runs OpenSCAD again and rebuilds this solid. Faces, sketches, extrudes and fillets stay available."
+    };
+    ui_kit::text(ui, note, ui_kit::Text::Note("scad_mesh"));
     if !k.note.is_empty() {
         ui_kit::text(ui, &k.note, ui_kit::Text::Note("scad_note"));
     }
@@ -316,7 +369,62 @@ pub fn commands(k: &Dlg) -> Result<Vec<(String, Value)>, String> {
         }
         body["fn"] = json!(n);
     }
+    if let Some(n) = k.fa.filter(|n| n.is_finite()) {
+        body["fa"] = json!(n);
+    }
+    if let Some(n) = k.fs.filter(|n| n.is_finite()) {
+        body["fs"] = json!(n);
+    }
     Ok(vec![("scad.insert".into(), body)])
+}
+
+fn prepare(app: &mut SolveApp, k: &mut Dlg) {
+    if k.prepared || k.pending_path.is_empty() {
+        return;
+    }
+    k.prepared = true;
+    if k.dir.trim().is_empty() {
+        return;
+    }
+    let dir = k.dir.clone();
+    let loaded = load(app, &dir);
+    apply_load(k, loaded);
+    restore_script(k);
+}
+
+fn restore_script(k: &mut Dlg) {
+    if k.pending_path.is_empty() {
+        return;
+    }
+    let Some(index) = k.files.iter().position(|file| same_path(&file.path, &k.pending_path)) else { return };
+    k.script = index;
+    apply_overrides(&mut k.files[index], &k.overrides);
+}
+
+fn same_path(a: &str, b: &str) -> bool {
+    a == b || a.eq_ignore_ascii_case(b) || std::path::Path::new(a) == std::path::Path::new(b)
+}
+
+fn apply_overrides(file: &mut Script, overrides: &Map<String, Value>) {
+    for param in &mut file.params {
+        let Some(value) = overrides.get(&param.name) else { continue };
+        match value {
+            Value::Bool(on) => param.text = if *on { "true" } else { "false" }.to_string(),
+            Value::String(text) => {
+                param.text.clone_from(text);
+                if let Some(index) = param.options.iter().position(|option| option == text) {
+                    param.option = index;
+                }
+            }
+            Value::Number(n) => {
+                param.text = n.to_string();
+                if let Some(index) = param.options.iter().position(|option| option == &param.text) {
+                    param.option = index;
+                }
+            }
+            _ => {}
+        }
+    }
 }
 
 #[cfg(test)]
@@ -372,5 +480,100 @@ mod tests {
         let h = crate::scenario::Harness::new();
         let d = crate::dialogs::Dialog::for_command(&h.app, "scad.insert").unwrap();
         assert!(matches!(d.kind, Kind::Scad(_)));
+    }
+
+    #[test]
+    fn editing_the_timeline_step_reopens_the_script() {
+        use serde_json::json;
+        use solidcraft_engine::Session;
+        use solidcraft_engine::doc::{Document, Expr, FeatureKind, MeshSolid, ScadSource};
+
+        fn recognition(path: &str, scad: Option<ScadSource>) -> MeshSolid {
+            let expr = |text: &str| Expr::new(text);
+            MeshSolid {
+                files: vec![path.to_string()],
+                tolerance: expr("0.05 mm"),
+                angle: expr("15 deg"),
+                mesh: 100.0,
+                cylinders: true,
+                cones: true,
+                tori: true,
+                spheres: true,
+                threads: true,
+                freeform: true,
+                origin: [expr("0 mm"), expr("0 mm"), expr("0 mm")],
+                scad,
+            }
+        }
+
+        let mut parameters = serde_json::Map::new();
+        parameters.insert("width".into(), json!(12));
+        let mut doc = Document::default();
+        let saved = doc
+            .add_feature(
+                FeatureKind::MeshImport {
+                    file: "bracket.scad.stl".into(),
+                    meshes: vec![],
+                    solid: Some(recognition(
+                        "C:/lib/bracket.scad",
+                        Some(ScadSource {
+                            path: "C:/lib/bracket.scad".into(),
+                            parameters,
+                            openscad: Some("C:/Program Files/OpenSCAD/openscad.exe".into()),
+                            segments: Some(48),
+                            fa: Some(12.0),
+                            fs: None,
+                        }),
+                    )),
+                },
+                Some("Bracket"),
+            )
+            .unwrap();
+        let older = doc
+            .add_feature(
+                FeatureKind::MeshImport { file: "older.scad.stl".into(), meshes: vec![], solid: Some(recognition("C:/lib/older.scad", None)) },
+                Some("Older"),
+            )
+            .unwrap();
+        let mut h = crate::scenario::Harness::new();
+        h.app.session = Session::new(doc);
+        let mut d = crate::dialogs::for_feature(&h.app, saved, None).unwrap();
+        assert_eq!(d.editing.map(|(id, _)| id), Some(saved));
+        let Kind::Scad(k) = &d.kind else { panic!("the timeline step opens the OpenSCAD dialog") };
+        assert!(k.pending_path.ends_with("bracket.scad"), "{}", k.pending_path);
+        assert!(k.dir.to_ascii_lowercase().contains("lib"), "{}", k.dir);
+        assert_eq!(k.overrides["width"], json!(12));
+        assert_eq!(k.fn_text, "48");
+        assert_eq!(k.fa, Some(12.0));
+        assert!(k.openscad.contains("openscad"));
+        let path = k.pending_path.clone();
+        if let Kind::Scad(k) = &mut d.kind {
+            k.files.push(Script {
+                name: "bracket.scad".into(),
+                path,
+                extra: 0,
+                params: vec![ParamRow {
+                    name: "width".into(),
+                    kind: "int".into(),
+                    group: "Size".into(),
+                    description: String::new(),
+                    text: "20".into(),
+                    options: Vec::new(),
+                    option: 0,
+                }],
+            });
+            k.script = 0;
+            k.prepared = true;
+        }
+        let cmds = crate::dialogs::apply_commands(&h.app, &d).unwrap();
+        assert_eq!(cmds[0].0, "scad.revise");
+        assert_eq!(cmds[0].1["feature"], saved);
+        assert_eq!(cmds[0].1["parameters"]["width"], 20);
+        assert_eq!(cmds[0].1["fn"], 48);
+        assert_eq!(cmds[0].1["fa"], 12.0);
+        let older_dialog = crate::dialogs::for_feature(&h.app, older, None).unwrap();
+        let Kind::Scad(k) = &older_dialog.kind else { panic!("an import that only recorded the .scad path still opens this dialog") };
+        assert!(k.pending_path.ends_with("older.scad"), "{}", k.pending_path);
+        assert!(k.overrides.is_empty());
     }
 }

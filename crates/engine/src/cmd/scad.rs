@@ -1,10 +1,13 @@
-//! OpenSCAD scripts as mesh components.
+//! OpenSCAD scripts as editable solids.
 //!
 //! A library is a folder of `.scad` files the user already has. `scad.list` and
 //! `scad.parameters` read the Customizer assignments at the top of each file (a group
 //! comment, then `name = value; // [min:max]`). `scad.insert` asks the installed OpenSCAD
-//! program to write an STL and inserts that mesh. OpenSCAD is not linked or shipped:
-//! it is a separate program, the same way a slicer is.
+//! program to write an STL, then rebuilds that mesh as a solid with the same face
+//! recognition as `mesh.convert`, so faces highlight and sketch, extrude and fillet apply.
+//! The feature keeps the script path and the values used. `scad.revise` runs OpenSCAD
+//! again and replaces that same solid. OpenSCAD is not linked or shipped: it is a
+//! separate program, the same way a slicer is.
 
 use std::path::{Path, PathBuf};
 
@@ -24,6 +27,9 @@ const MAX_SCAN: usize = 4_000;
 const MAX_PARAMS: usize = 128;
 /// STL OpenSCAD may hand back.
 const MAX_STL: usize = 64 << 20;
+/// Matches the kernel's solid-reconstruction budget. A denser STL is refused before it
+/// is stored as a mesh the rest of the model cannot edit.
+const MAX_SCAD_TRIANGLES: u32 = 100_000;
 
 pub static COMMANDS: &[CommandSpec] = &[
     CommandSpec::new("scad.list", "List OpenSCAD Scripts", list)
@@ -48,7 +54,15 @@ pub static COMMANDS: &[CommandSpec] = &[
             "path: .scad file; parameters?: {name: value} overriding that file's Customizer values (names and kinds must match the file); \
              name?; openscad?: path of the OpenSCAD program (its file name must be openscad, openscad.exe or openscad.com; default: the one on PATH); \
              timeout?: seconds 1–180 (default 60); fn?, fa?, fs? (OpenSCAD's $fn, $fa, $fs). \
-             Runs that program to write an STL and inserts the mesh in the active component. The mesh does not rebuild when the script changes.",
+             Runs that program to write an STL, then rebuilds it as an editable solid in the active component (faces, edges, sketch, extrude, fillet). \
+             The feature keeps the script and these values; editing it runs scad.revise.",
+        ),
+    CommandSpec::new("scad.revise", "Revise OpenSCAD", revise)
+        .icon("import")
+        .enabled(super::not_in_sketch)
+        .params(
+            "feature: the OpenSCAD import to rebuild; path, parameters?, name?, openscad?, timeout?, fn?, fa?, fs?: the same as scad.insert. \
+             Runs OpenSCAD again and replaces that feature's solid. The component stays the one the import created.",
         ),
 ];
 
@@ -100,6 +114,18 @@ fn insert(s: &mut Session, p: &Value) -> Result<Value> {
     #[cfg(not(target_arch = "wasm32"))]
     {
         insert_native(s, p)
+    }
+}
+
+fn revise(s: &mut Session, p: &Value) -> Result<Value> {
+    #[cfg(target_arch = "wasm32")]
+    {
+        let _ = (s, p);
+        Err(EngineError::Other("scad.revise: OpenSCAD import is a desktop feature".into()))
+    }
+    #[cfg(not(target_arch = "wasm32"))]
+    {
+        revise_native(s, p)
     }
 }
 
@@ -229,54 +255,187 @@ fn describe_file(path: &Path) -> Value {
 }
 
 #[cfg(not(target_arch = "wasm32"))]
-fn insert_native(s: &mut Session, p: &Value) -> Result<Value> {
-    let cmd = "scad.insert";
-    let path = path_arg(p, cmd)?;
-    solidcraft_io::vfs::check(path).map_err(|e| EngineError::Other(e.to_string()))?;
-    if !is_scad(path) {
+struct Built {
+    bytes: Vec<u8>,
+    program: PathBuf,
+    overrides: Vec<(String, Value)>,
+    quality: Vec<(String, Value)>,
+    path: String,
+}
+
+#[cfg(not(target_arch = "wasm32"))]
+fn build(p: &Value, cmd: &str) -> Result<Built> {
+    let path = path_arg(p, cmd)?.to_string();
+    solidcraft_io::vfs::check(&path).map_err(|e| EngineError::Other(e.to_string()))?;
+    if !is_scad(&path) {
         return Err(bad(cmd, "`path` must be a .scad file"));
     }
-    let source = read_source(path).map_err(|e| bad(cmd, e))?;
+    let source = read_source(&path).map_err(|e| bad(cmd, e))?;
     let known = parse_parameters(&source);
     let overrides = overrides(p, &known, cmd)?;
     let quality = quality(p, cmd)?;
     let timeout = timeout_secs(p, cmd)?;
     let explicit = str_(p, "openscad").map(str::trim).filter(|x| !x.is_empty());
-    if let Some(program) = explicit
-        && (program.len() > 4096 || program.chars().any(|c| c == '\0' || c.is_control()))
-    {
+    if let Some(program) = explicit && (program.len() > 4096 || program.chars().any(|c| c == '\0' || c.is_control())) {
         return Err(bad(cmd, "`openscad` must be a program path"));
     }
     let program = find_program(explicit).map_err(|e| bad(cmd, e))?;
     let mut assignments = Vec::new();
-    for (name, value) in quality {
-        assignments.push(scad_assign(&name, &value).map_err(|e| bad(cmd, e))?);
+    for (name, value) in &quality {
+        assignments.push(scad_assign(name, value).map_err(|e| bad(cmd, e))?);
     }
     for (name, value) in &overrides {
         assignments.push(scad_assign(name, value).map_err(|e| bad(cmd, e))?);
     }
-    let bytes = render(&program, Path::new(path), &assignments, timeout).map_err(|e| EngineError::Other(e))?;
-    let mut out = import_stl(s, &bytes, path, str_(p, "name"))?;
+    let bytes = render(&program, Path::new(&path), &assignments, timeout).map_err(EngineError::Other)?;
+    let triangles = stl_triangle_count(&bytes);
+    if triangles > MAX_SCAD_TRIANGLES {
+        return Err(EngineError::Other(format!(
+            "OpenSCAD produced {triangles} triangles, above the {MAX_SCAD_TRIANGLES} that can become an editable solid. Set a lower $fn or a larger $fa and try again."
+        )));
+    }
+    Ok(Built { bytes, program, overrides, quality, path })
+}
+
+#[cfg(not(target_arch = "wasm32"))]
+fn insert_native(s: &mut Session, p: &Value) -> Result<Value> {
+    let built = build(p, "scad.insert")?;
+    let recipe = recipe_of(&built.path, &built.program, &built.overrides, &built.quality);
+    let mut out = import_stl(s, &built.bytes, str_(p, "name"), recipe)?;
     if let Value::Object(map) = &mut out {
-        map.insert("path".into(), json!(path));
-        map.insert("openscad".into(), json!(program.display().to_string()));
-        map.insert("parameters".into(), Value::Object(overrides.into_iter().collect()));
+        map.insert("path".into(), json!(built.path));
+        map.insert("openscad".into(), json!(built.program.display().to_string()));
+        map.insert("parameters".into(), Value::Object(built.overrides.into_iter().collect()));
     }
     Ok(out)
 }
 
-fn import_stl(s: &mut Session, bytes: &[u8], source: &str, name: Option<&str>) -> Result<Value> {
-    let label = format!("{source}.stl");
+#[cfg(not(target_arch = "wasm32"))]
+fn revise_native(s: &mut Session, p: &Value) -> Result<Value> {
+    let cmd = "scad.revise";
+    let built = build(p, cmd)?;
+    let id = p.get("feature").and_then(Value::as_u64).ok_or_else(|| bad(cmd, "`feature` is required"))?;
+    let existing = s.doc.feature(id).ok_or_else(|| bad(cmd, "that feature is not in this design"))?;
+    if !is_scad_kind(&existing.kind) {
+        return Err(bad(cmd, "that feature is not an OpenSCAD import"));
+    }
+    let label = format!("{}.stl", built.path);
+    let mf = solidcraft_io::mesh_import_feature(&built.bytes, &label).map_err(|e| EngineError::Other(e.to_string()))?;
+    let recipe = recipe_of(&built.path, &built.program, &built.overrides, &built.quality);
+    let kind = editable_solid(mf.kind, recipe)?;
+    install(s, id, kind, mf.body_names, str_(p, "name"), cmd)?;
+    let bodies: Vec<String> = s.model.state().bodies.iter().filter(|b| b.feature == id).map(|b| b.name.clone()).collect();
+    let feature_name = s.doc.feature(id).map(|f| f.name.clone()).unwrap_or_default();
+    Ok(json!({
+        "feature": id,
+        "name": feature_name,
+        "bodies": bodies,
+        "solid": true,
+        "path": built.path,
+        "openscad": built.program.display().to_string(),
+        "parameters": Value::Object(built.overrides.into_iter().collect()),
+    }))
+}
+
+#[cfg(not(target_arch = "wasm32"))]
+fn is_scad_kind(kind: &solidcraft_doc::FeatureKind) -> bool {
+    let solidcraft_doc::FeatureKind::MeshImport { solid: Some(solid), .. } = kind else { return false };
+    solid.scad.is_some() || solid.files.iter().any(|path| path.to_ascii_lowercase().ends_with(".scad"))
+}
+
+#[cfg(not(target_arch = "wasm32"))]
+fn recipe_of(path: &str, program: &Path, overrides: &[(String, Value)], quality: &[(String, Value)]) -> solidcraft_doc::ScadSource {
+    let mut parameters = serde_json::Map::new();
+    for (name, value) in overrides {
+        parameters.insert(name.clone(), value.clone());
+    }
+    let number = |key: &str| quality.iter().find(|(name, _)| name == key).and_then(|(_, value)| value.as_f64());
+    let segments = number("$fn").filter(|n| n.fract() == 0.0 && (0.0..=1024.0).contains(n)).map(|n| n as u64);
+    solidcraft_doc::ScadSource {
+        path: path.to_string(),
+        parameters,
+        openscad: Some(program.display().to_string()),
+        segments,
+        fa: number("$fa"),
+        fs: number("$fs"),
+    }
+}
+
+#[cfg(not(target_arch = "wasm32"))]
+fn import_stl(s: &mut Session, bytes: &[u8], name: Option<&str>, recipe: solidcraft_doc::ScadSource) -> Result<Value> {
+    let label = format!("{}.stl", recipe.path);
     let mf = solidcraft_io::mesh_import_feature(bytes, &label).map_err(|e| EngineError::Other(e.to_string()))?;
     let feature_name = name.map(str::trim).filter(|n| !n.is_empty()).map(str::to_string).unwrap_or_else(|| mf.name.clone());
-    let component = super::file::import::component_name(source, name);
-    let (id, placed) = super::file::import::add_in_component(s, mf.kind, &feature_name, mf.body_names, &component, super::file::import::Tree::Flat)?;
+    let component = super::file::import::component_name(&recipe.path, name);
+    let kind = editable_solid(mf.kind, recipe)?;
+    let (id, placed) = super::file::import::add_in_component(s, kind, &feature_name, mf.body_names, &component, super::file::import::Tree::Flat)?;
     let bodies: Vec<String> = s.model.state().bodies.iter().filter(|b| b.feature == id).map(|b| b.name.clone()).collect();
     let created_bodies = bodies.clone();
     let feature_name = s.doc.feature(id).map(|f| f.name.clone()).unwrap_or_default();
-    let mut out = json!({"feature": id, "name": feature_name, "bodies": bodies, "created_bodies": created_bodies, "warnings": mf.warnings});
+    let mut out = json!({"feature": id, "name": feature_name, "bodies": bodies, "created_bodies": created_bodies, "warnings": mf.warnings, "solid": true});
     placed.report(&mut out);
     Ok(out)
+}
+
+/// Replace one OpenSCAD feature's solid. The component it already lives in stays.
+#[cfg(not(target_arch = "wasm32"))]
+fn install(s: &mut Session, id: u64, kind: solidcraft_doc::FeatureKind, body_names: Vec<String>, name: Option<&str>, cmd: &str) -> Result<()> {
+    let component = {
+        let feature = s.doc_mut().features.iter_mut().find(|f| f.id == id).ok_or_else(|| bad(cmd, "that feature is not in this design"))?;
+        feature.kind = kind;
+        feature.body_names = body_names;
+        if let Some(name) = name.map(str::trim).filter(|n| !n.is_empty()) {
+            feature.name = name.chars().take(128).collect();
+        }
+        feature.component
+    };
+    if let Some(name) = name.map(str::trim).filter(|n| !n.is_empty()) {
+        let name: String = name.chars().take(128).collect();
+        if let Some(component) = s.doc_mut().components.iter_mut().find(|c| c.id == component) {
+            component.name = name;
+        }
+    }
+    s.refresh();
+    if let Some(error) = s.model.result(id).and_then(|r| r.error.clone()) {
+        return Err(EngineError::Other(error));
+    }
+    Ok(())
+}
+
+/// The STL OpenSCAD wrote, rebuilt as analytic faces (planes, cylinders, spheres, and
+/// leftover triangles as facets). That is the same body a STEP solid is: faces highlight
+/// and the modelling commands apply. The script and the values used stay on the feature
+/// so the timeline step can be opened again.
+#[cfg(not(target_arch = "wasm32"))]
+fn editable_solid(kind: solidcraft_doc::FeatureKind, recipe: solidcraft_doc::ScadSource) -> Result<solidcraft_doc::FeatureKind> {
+    let solidcraft_doc::FeatureKind::MeshImport { file, meshes, .. } = kind else {
+        return Err(EngineError::Other("OpenSCAD import did not produce a mesh".into()));
+    };
+    let triangles: usize = meshes.iter().map(|mesh| mesh.triangles.len() / 3).sum();
+    if triangles > MAX_SCAD_TRIANGLES as usize {
+        return Err(EngineError::Other(format!(
+            "OpenSCAD produced {triangles} triangles, above the {MAX_SCAD_TRIANGLES} that can become an editable solid. Set a lower $fn or a larger $fa and try again."
+        )));
+    }
+    let expr = |text: &str| solidcraft_doc::Expr::new(text);
+    Ok(solidcraft_doc::FeatureKind::MeshImport {
+        file,
+        meshes,
+        solid: Some(solidcraft_doc::MeshSolid {
+            files: vec![recipe.path.clone()],
+            tolerance: expr("0.05 mm"),
+            angle: expr("15 deg"),
+            mesh: 100.0,
+            cylinders: true,
+            cones: true,
+            tori: true,
+            spheres: true,
+            threads: true,
+            freeform: true,
+            origin: [expr("0 mm"), expr("0 mm"), expr("0 mm")],
+            scad: Some(recipe),
+        }),
+    })
 }
 
 fn overrides(p: &Value, known: &[Param], cmd: &str) -> Result<Vec<(String, Value)>> {
@@ -426,6 +585,33 @@ fn read_capped(path: &Path, max: usize) -> String {
     let Ok(bytes) = std::fs::read(path) else { return String::new() };
     let n = bytes.len().min(max);
     String::from_utf8_lossy(&bytes[..n]).trim().to_string()
+}
+
+/// Triangle count of a binary STL, or of an ASCII STL by its `facet normal` lines.
+#[cfg(not(target_arch = "wasm32"))]
+fn stl_triangle_count(bytes: &[u8]) -> u32 {
+    if bytes.len() >= 84 {
+        let n = u32::from_le_bytes([bytes[80], bytes[81], bytes[82], bytes[83]]);
+        let body = 84usize.saturating_add((n as usize).saturating_mul(50));
+        if n > 0 && body == bytes.len() {
+            return n;
+        }
+    }
+    let needle = b"facet normal";
+    let mut n = 0u32;
+    let mut i = 0usize;
+    while i + needle.len() <= bytes.len() {
+        if bytes[i..i + needle.len()] == *needle {
+            n = n.saturating_add(1);
+            if n > MAX_SCAD_TRIANGLES {
+                return n;
+            }
+            i += needle.len();
+        } else {
+            i += 1;
+        }
+    }
+    n
 }
 
 #[cfg(not(target_arch = "wasm32"))]
@@ -1104,7 +1290,7 @@ module foo() {
 
     #[cfg(not(target_arch = "wasm32"))]
     #[test]
-    fn a_cube_stl_from_the_importer_is_a_mesh_component() {
+    fn a_cube_stl_from_the_importer_is_an_editable_solid() {
         let c = |i: usize| [(i & 1) as f32 * 10.0, ((i >> 1) & 1) as f32 * 10.0, ((i >> 2) & 1) as f32 * 10.0];
         let quads = [[0, 2, 3, 1], [4, 5, 7, 6], [0, 1, 5, 4], [2, 6, 7, 3], [0, 4, 6, 2], [1, 3, 7, 5]];
         let mut tris = Vec::new();
@@ -1121,8 +1307,40 @@ module foo() {
             bytes.extend([0, 0]);
         }
         let mut s = Session::default();
-        let out = import_stl(&mut s, &bytes, "bracket.scad", Some("Bracket")).unwrap();
+        let mut parameters = serde_json::Map::new();
+        parameters.insert("width".into(), json!(12));
+        let out = import_stl(
+            &mut s,
+            &bytes,
+            Some("Bracket"),
+            solidcraft_doc::ScadSource { path: "bracket.scad".into(), parameters, openscad: None, segments: Some(32), fa: None, fs: None },
+        )
+        .unwrap();
         assert_eq!(out["component_name"], "Bracket");
-        assert!(!out["bodies"].as_array().unwrap().is_empty());
+        assert_eq!(out["solid"], json!(true));
+        let id = out["feature"].as_u64().unwrap();
+        let solidcraft_doc::FeatureKind::MeshImport { solid: Some(solid), .. } = &s.doc.feature(id).unwrap().kind else {
+            panic!("the import is a solid");
+        };
+        let saved = solid.scad.as_ref().unwrap();
+        assert_eq!(saved.path, "bracket.scad");
+        assert_eq!(saved.parameters["width"], json!(12));
+        assert_eq!(saved.segments, Some(32));
+        let components = s.doc.components.len();
+        let features = s.doc.features.len();
+        let err = s.execute("scad.revise", &json!({"feature": id, "path": "bracket.scad"})).unwrap_err().to_string();
+        assert!(err.contains("bracket.scad") || err.contains("OpenSCAD") || err.contains("not found"), "{err}");
+        assert_eq!(s.doc.components.len(), components);
+        assert_eq!(s.doc.features.len(), features);
+        let name = out["bodies"][0].as_str().unwrap().to_string();
+        {
+            let state = s.model.state();
+            let body = &state.body(&name).unwrap().body;
+            assert!(!body.is_mesh(), "OpenSCAD output must be a solid, so faces can highlight");
+            assert_eq!(body.faces(0.01).unwrap().len(), 6);
+        }
+        s.active_component = out["component"].as_u64().unwrap();
+        s.execute("solid.fillet", &json!({"body": name, "edges": [[5.0, 0.0, 0.0]], "radius": 1})).unwrap();
+        assert!(s.model.results.iter().all(|r| r.error.is_none()), "{:?}", s.model.results);
     }
 }

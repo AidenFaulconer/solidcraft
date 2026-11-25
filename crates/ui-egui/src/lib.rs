@@ -144,6 +144,8 @@ pub(crate) mod display_lod;
 mod file_load_ui_tests;
 #[cfg(test)]
 mod fillet_spline_handle_tests;
+mod import_jobs;
+mod mesh_groups;
 pub mod mouse_gesture;
 pub(crate) mod navigation;
 pub(crate) mod open_meshing;
@@ -412,6 +414,8 @@ pub struct SolveApp {
     pub preview: preview::PreviewState,
     /// OK pressed on a feature that takes a while: its evaluation runs off the window thread.
     pub applying: Option<dialogs::Applying>,
+    /// STL and OpenSCAD imports running off the window thread, and those queued behind them.
+    pub imports: import_jobs::Queue,
     /// A command recomputing the history (the marker moved, undo) computing off the window
     /// thread, and those asked for meanwhile ([`deferred`]).
     pub deferred: Option<deferred::Deferred>,
@@ -551,6 +555,7 @@ impl SolveApp {
             slicer_menu: dialogs_save_mesh::SlicerMenu::default(),
             preview: preview::PreviewState::default(),
             applying: None,
+            imports: import_jobs::Queue::default(),
             deferred: None,
             deferred_queue: Vec::new(),
             delete_check: None,
@@ -1425,6 +1430,7 @@ impl SolveApp {
         render_workspace::sync_backend(self);
         render_workspace::tick(self, ctx);
         file_load::tick(self, ctx);
+        import_jobs::tick(self, ctx);
         save_job::tick(self, false);
         if self.saving.is_some() {
             ctx.request_repaint_after(std::time::Duration::from_millis(16));
@@ -1551,6 +1557,7 @@ impl SolveApp {
         issue_report::CadInput::block(self, ui, report_input);
         file_load::show(self, ui.ctx());
         open_meshing::show(self, ui.ctx());
+        import_jobs::show(self, ui.ctx());
         documents::prompt(self, ui.ctx());
         update::show(self, ui.ctx());
         install::show(self, ui.ctx());

@@ -9,6 +9,7 @@ fn imported_box() -> Session {
     doc.add_feature(
         FeatureKind::MeshImport {
             file: "public-safe-box.stl".into(),
+            solid: None,
             meshes: vec![MeshData {
                 name: "Mesh".into(),
                 positions: mesh.positions.iter().flat_map(|p| [p.x, p.y, p.z]).collect(),
@@ -309,4 +310,26 @@ fn convert_files_writes_one_step_per_stl_and_leaves_the_design() {
     assert!(s.execute("mesh.convert_files", &json!({"path": dir.join("note.txt")})).is_err());
     assert!(s.execute("mesh.convert_files", &json!({})).is_err());
     let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn import_stl_places_a_solid_in_the_design() {
+    let mut s = Session::default();
+    run(&mut s, "solid.box", json!({"length": 10, "width": 20, "height": 30, "operation": "new", "body_name": "Stock"}));
+    let path = std::env::temp_dir().join(format!("solidcraft-import-stl-{}.stl", std::process::id()));
+    run(&mut s, "file.save_mesh", json!({"path": &path, "bodies": ["Stock"]}));
+    run(&mut s, "file.new", json!({"name": "Placed"}));
+    let r = run(&mut s, "mesh.import", json!({"path": path.to_string_lossy(), "origin": ["100 mm", "0 mm", "0 mm"], "tolerance": "0.05 mm"}));
+    assert!(r["feature"].as_u64().is_some(), "{r}");
+    let state = s.model.state();
+    let body = state.bodies.iter().find(|b| !b.body.is_mesh()).expect("a solid");
+    let mesh = body.body.tessellate(0.2).unwrap();
+    let min_x = mesh.positions.iter().map(|p| p.x).fold(f64::INFINITY, f64::min);
+    assert!(min_x > 90.0, "origin should shift the solid, min x {min_x}");
+    let solid = s.doc.features.iter().find_map(|f| match &f.kind {
+        FeatureKind::MeshImport { solid: Some(solid), .. } => Some(solid),
+        _ => None,
+    });
+    assert_eq!(solid.map(|item| item.origin[0].as_str()), Some("100 mm"));
+    let _ = std::fs::remove_file(path);
 }

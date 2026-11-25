@@ -39,6 +39,7 @@ fn file_commands_stay_inside_the_agents_folders() {
             ("scad.list", json!({"path": at(&out, "a.scad")})),
             ("scad.parameters", json!({"path": at(&out, "a.scad")})),
             ("scad.insert", json!({"path": at(&out, "a.scad")})),
+            ("scad.revise", json!({"path": at(&out, "a.scad"), "feature": 1})),
             ("doc.recovery_list", json!({"dir": out.to_string_lossy()})),
             ("doc.recovery_discard", json!({"dir": out.to_string_lossy(), "id": "part"})),
             ("doc.recover", json!({"dir": out.to_string_lossy(), "id": "part", "discard": true})),

@@ -1639,11 +1639,57 @@ pub enum FeatureKind {
         freeform: bool,
     },
     /// Mesh bodies imported from a 3MF or STL file, embedded in the design.
+    /// `solid` rebuilds those meshes as timeline solids placed on an origin. Absent, the
+    /// meshes stay mesh bodies.
     MeshImport {
         /// Source file name (display only).
         file: String,
         meshes: Vec<MeshData>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        solid: Option<MeshSolid>,
     },
+}
+
+/// The script and values an OpenSCAD import was built from, so the timeline step can
+/// reopen that dialog and rebuild the same solid.
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+pub struct ScadSource {
+    pub path: String,
+    #[serde(default, skip_serializing_if = "serde_json::Map::is_empty")]
+    pub parameters: serde_json::Map<String, serde_json::Value>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub openscad: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none", rename = "fn")]
+    pub segments: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub fa: Option<f64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub fs: Option<f64>,
+}
+
+/// Recognition and placement for an STL import that becomes solids in the open design.
+/// The meshes stay on the feature, so a later edit can change the fit without the file.
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize, solidcraft_derive::Walk)]
+pub struct MeshSolid {
+    /// Paths the import was read from, so editing the feature can read them again.
+    pub files: Vec<String>,
+    #[walk(length = "Tolerance")]
+    pub tolerance: Expr,
+    #[walk(angle = "Angle")]
+    pub angle: Expr,
+    pub mesh: f64,
+    pub cylinders: bool,
+    pub cones: bool,
+    pub tori: bool,
+    pub spheres: bool,
+    pub threads: bool,
+    pub freeform: bool,
+    /// Translation, in the feature's component, added to every solid.
+    #[walk(length = ["Origin X", "Origin Y", "Origin Z"])]
+    pub origin: [Expr; 3],
+    /// Set when this solid came from an OpenSCAD script. Absent on an STL import.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub scad: Option<ScadSource>,
 }
 
 /// What fills the corner where three blended edges meet.
@@ -2322,6 +2368,7 @@ impl FeatureKind {
             FeatureKind::ReverseNormal { .. } => "ReverseNormal",
             FeatureKind::SurfaceUntrim { .. } => "Untrim",
             FeatureKind::Import { .. } => "Import",
+            FeatureKind::MeshImport { solid: Some(_), .. } => "StlSolid",
             FeatureKind::MeshImport { .. } => "Mesh",
             FeatureKind::MeshConvert { .. } => "ConvertMesh",
         }

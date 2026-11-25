@@ -311,8 +311,18 @@ pub fn show(app: &mut SolveApp, ui: &mut egui::Ui, painter: &egui::Painter, proj
             dragging = true;
         }
         // Read the triad again after the drag, so the box follows it in the same frame. Move
-        // types with no triad (Rotate, Point to Point, Point to Position) put the box on the
-        // picked bodies instead.
+        // types with no triad (Rotate, Point to Point, Point to Position, Align Frames) put
+        // the box on the picked bodies instead. Align Frames draws its own triads.
+        let frames = crate::dialogs_move::preview(app, &d, proj);
+        for frame in &frames.frames {
+            crate::gizmo::paint_frame(painter, proj, frame);
+        }
+        let ink = Tokens::get().accent;
+        for mark in &frames.marks {
+            if let Some(s) = proj.to_screen(*mark) {
+                painter.circle_filled(s, 3.0, ink);
+            }
+        }
         let triad = crate::dialogs_move::triad(app, &d);
         let at = triad.map(|t| t.center).or_else(|| anchor(app, &d).map(|(base, _)| base));
         let focus = std::mem::take(&mut d.focus);
